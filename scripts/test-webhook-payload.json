@@ -1,0 +1,12 @@
+{
+  "ticker": "EUR_USD",
+  "exchange": "OANDA",
+  "interval": "15",
+  "close": "1.0850",
+  "open": "1.0845",
+  "high": "1.0855",
+  "low": "1.0840",
+  "volume": "1000",
+  "time": "2024-01-01T12:00:00Z",
+  "timenow": "2024-01-01T12:00:00Z"
+}

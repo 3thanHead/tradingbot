@@ -1,0 +1,22 @@
+ON (RSI_GREATER_THAN_70_TRADING_VIEW_EVENT):
+	IF (!position_open):
+        ON (RSI_MOVING_DOWN_TRADING_VIEW_EVENT):
+            open_short_position(currency_pair)
+
+ON (RSI_LESS_THAN_30_TRADING_VIEW_EVENT)
+	IF (!position_open):
+        ON (RSI_MOVING_UP_TRADING_VIEW_EVENT):
+            open_long_position(currency_pair)
+
+ON (MACD_CROSS_UP_TRADING_VIEW_EVENT):
+	IF (position_open):
+		IF (position == "short"):
+			ON (MACD_MOVING_UP_TRADING_VIEW_EVENT):
+				close_position(currency_pair)
+				
+ON (MACD_CROSS_DOWN_TRADING_VIEW_EVENT):
+	IF (position_open):
+		IF (position == "long"):
+			ON (MACD_MOVING_DOWN_TRADING_VIEW_EVENT):
+				close_position(currency_pair)
+				

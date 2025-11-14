@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - OANDA_API_KEY=${OANDA_API_KEY}
+      - OANDA_ACCOUNT_ID=${OANDA_ACCOUNT_ID}
+      - TRADE_UNITS=${TRADE_UNITS:-100}
+      - TRADE_USD_AMOUNT=${TRADE_USD_AMOUNT}
+      - MARGIN_AMOUNT=${MARGIN_AMOUNT}
+    restart: unless-stopped
+    container_name: tradingview-webhook-bot
+    networks:
+      - trading-network
+
+  # ngrok tunnel (enabled by default)
+  # To disable: docker-compose up trading-bot
+  # For static domain: set NGROK_STATIC_DOMAIN in .env (see NGROK_STATIC_DOMAIN.md)
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: /entrypoint.sh
+    depends_on:
+      - trading-bot
+    restart: unless-stopped
+    container_name: ngrok-tunnel
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+      - NGROK_STATIC_DOMAIN=${NGROK_STATIC_DOMAIN}
+    ports:
+      - "4040:4040"  # ngrok web UI
+    volumes:
+      - ./ngrok-entrypoint.sh:/entrypoint.sh:ro
+      - ./ngrok.yml:/etc/ngrok.yml:ro
+    networks:
+      - trading-network
+
+networks:
+  trading-network:
+    driver: bridge
