@@ -736,10 +736,16 @@ func closePosition(symbol string) {
 		state.PositionOpen = false
 		state.Position = "none"
 		state.TradeID = ""
+		// Reset all state machine flags
+		state.RSICrossedUp = false
+		state.RSICrossedDown = false
+		state.MACDCrossedUp = false
+		state.MACDCrossedDown = false
+		state.RSICrossedCenter = false
 		mu.Unlock()
 
 		log.Printf("✅ Position closed: %s", symbol)
-		log.Printf("💾 [STATE] Position updated - Open=%v, Type=%s", state.PositionOpen, state.Position)
+		log.Printf("💾 [STATE] Position updated - Open=%v, Type=%s, All flags reset", state.PositionOpen, state.Position)
 	} else {
 		// Read response body for error details
 		var responseBody map[string]interface{}
