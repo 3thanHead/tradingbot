@@ -52,6 +52,8 @@ var (
 	tradeUnits     string                               // Trading units (fixed amount)
 	tradeUSDAmount string                               // USD notional amount (calculates units from price)
 	tradeMargin    string                               // Margin amount (OANDA calculates position size based on leverage)
+	takeProfitPips string                               // Take profit in pips (e.g., "50")
+	takeProfitPct  string                               // Take profit in percentage (e.g., "2.5" for 2.5%)
 )
 
 // Get or create position state for a symbol
@@ -464,6 +466,64 @@ func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	return fmt.Sprintf("%d", unitsInt), nil
 }
 
+// Calculate take profit price based on pips or percentage
+func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool) (string, error) {
+	if takeProfitPips == "" && takeProfitPct == "" {
+		return "", nil // No take profit set
+	}
+
+	var tpPrice float64
+
+	if takeProfitPips != "" {
+		// Calculate based on pips
+		pips := 0.0
+		fmt.Sscanf(takeProfitPips, "%f", &pips)
+
+		// Determine pip value based on instrument
+		// For JPY pairs (e.g., USD_JPY), 1 pip = 0.01
+		// For most other pairs, 1 pip = 0.0001
+		pipValue := 0.0001
+		if strings.Contains(symbol, "JPY") {
+			pipValue = 0.01
+		}
+
+		pipDistance := pips * pipValue
+
+		if isLong {
+			tpPrice = entryPrice + pipDistance
+		} else {
+			tpPrice = entryPrice - pipDistance
+		}
+
+		log.Printf("🎯 [TP CALC] %.0f pips = %.5f price distance", pips, pipDistance)
+		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+
+	} else if takeProfitPct != "" {
+		// Calculate based on percentage
+		pct := 0.0
+		fmt.Sscanf(takeProfitPct, "%f", &pct)
+
+		priceMove := entryPrice * (pct / 100.0)
+
+		if isLong {
+			tpPrice = entryPrice + priceMove
+		} else {
+			tpPrice = entryPrice - priceMove
+		}
+
+		log.Printf("🎯 [TP CALC] %.2f%% = %.5f price distance", pct, priceMove)
+		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+	}
+
+	// Format price with appropriate precision
+	precision := 5
+	if strings.Contains(symbol, "JPY") {
+		precision = 3
+	}
+
+	return fmt.Sprintf("%.*f", precision, tpPrice), nil
+}
+
 // Get trade specification for OANDA order (units or margin-based)
 func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 	orderSpec := map[string]interface{}{
@@ -519,6 +579,21 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 				unitsStr = "-" + unitsStr
 			}
 			orderSpec["units"] = unitsStr
+
+			// Add take profit if configured
+			if takeProfitPips != "" || takeProfitPct != "" {
+				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong)
+				if err != nil {
+					log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
+				} else if tpPrice != "" {
+					orderSpec["takeProfitOnFill"] = map[string]interface{}{
+						"price":       tpPrice,
+						"timeInForce": "GTC",
+					}
+					log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
+				}
+			}
+
 			return orderSpec
 		}
 	}
@@ -552,6 +627,27 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 	}
 
 	orderSpec["units"] = units
+
+	// Add take profit if configured
+	if takeProfitPips != "" || takeProfitPct != "" {
+		// Get current price for TP calculation
+		price, err := getCurrentPrice(symbol)
+		if err != nil {
+			log.Printf("⚠️  [WARNING] Failed to get price for TP calculation: %v", err)
+		} else {
+			tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong)
+			if err != nil {
+				log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
+			} else if tpPrice != "" {
+				orderSpec["takeProfitOnFill"] = map[string]interface{}{
+					"price":       tpPrice,
+					"timeInForce": "GTC",
+				}
+				log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
+			}
+		}
+	}
+
 	return orderSpec
 }
 
@@ -887,6 +983,10 @@ func main() {
 	tradeUSDAmount = os.Getenv("TRADE_USD_AMOUNT")
 	tradeUnits = os.Getenv("TRADE_UNITS")
 
+	// Take profit configuration
+	takeProfitPips = os.Getenv("TAKE_PROFIT_PIPS")
+	takeProfitPct = os.Getenv("TAKE_PROFIT_PCT")
+
 	// Default to 100 units if nothing specified
 	if tradeUnits == "" && tradeUSDAmount == "" && tradeMargin == "" {
 		tradeUnits = "100"
@@ -908,6 +1008,15 @@ func main() {
 		log.Printf("💵 Trade Amount: $%s USD (units calculated per trade)", tradeUSDAmount)
 	} else {
 		log.Printf("💰 Trade Units: %s (fixed)", tradeUnits)
+	}
+
+	// Show take profit settings
+	if takeProfitPips != "" {
+		log.Printf("🎯 Take Profit: %s pips", takeProfitPips)
+	} else if takeProfitPct != "" {
+		log.Printf("🎯 Take Profit: %s%%", takeProfitPct)
+	} else {
+		log.Printf("🎯 Take Profit: None (manual exit only)")
 	}
 
 	// Sync existing positions from OANDA on startup

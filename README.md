@@ -192,12 +192,42 @@ Deploy to cloud and use public IP/domain
 
 ## 🔧 Configuration
 
-### Change Trading Units
+### Position Sizing
 
-Edit `main.go`:
-```go
-"units": "100",  // Change to desired position size
+Choose one of three methods in your `.env` file:
+
+**Option 1: Margin-Based (Recommended)**
+```bash
+MARGIN_AMOUNT=100  # $100 margin, leverage applied automatically
 ```
+
+**Option 2: USD Amount**
+```bash
+TRADE_USD_AMOUNT=1000  # $1000 position size
+```
+
+**Option 3: Fixed Units**
+```bash
+TRADE_UNITS=1000  # 1000 units
+```
+
+See [MARGIN_AMOUNT.md](MARGIN_AMOUNT.md) for detailed explanation.
+
+### Take Profit
+
+Set automatic take profit in pips or percentage:
+
+**Pips:**
+```bash
+TAKE_PROFIT_PIPS=50  # 50 pip take profit
+```
+
+**Percentage:**
+```bash
+TAKE_PROFIT_PCT=2.5  # 2.5% gain take profit
+```
+
+See [TAKE_PROFIT.md](TAKE_PROFIT.md) for detailed examples and configuration.
 
 ### Switch to Live Trading
 
