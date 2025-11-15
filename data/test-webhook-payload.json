@@ -1,5 +1,5 @@
 {
-  "ticker": "EURUSD",
+  "ticker": "EUR_USD",
   "exchange": "OANDA",
   "interval": "15",
   "close": "1.0850",

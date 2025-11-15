@@ -12,6 +12,8 @@ services:
       - TRADE_UNITS=${TRADE_UNITS:-100}
       - TRADE_USD_AMOUNT=${TRADE_USD_AMOUNT}
       - MARGIN_AMOUNT=${MARGIN_AMOUNT}
+      - TAKE_PROFIT_PIPS=${TAKE_PROFIT_PIPS}
+      - TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}
     restart: unless-stopped
     container_name: tradingview-webhook-bot
     networks:
