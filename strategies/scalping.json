@@ -1,0 +1,42 @@
+{
+  "name": "scalping",
+  "description": "Fast scalping - quick entries on MACD + RSI neutral, tight exits",
+  "entry": {
+    "combination": "all",
+    "steps": [
+      {
+        "webhook": "/webhook/macd/cross-up",
+        "comment": "MACD crosses up (bullish signal)"
+      },
+      {
+        "webhook": "/webhook/rsi/crossed-center",
+        "comment": "RSI neutral (around 50, not extreme)"
+      }
+    ]
+  },
+  "exit": {
+    "combination": "any",
+    "conditions": [
+      {
+        "webhook": "/webhook/macd/cross-down",
+        "is_long": true,
+        "comment": "Quick MACD reversal exit"
+      },
+      {
+        "webhook": "/webhook/rsi/crossed-up",
+        "is_long": true,
+        "comment": "RSI overbought exit"
+      },
+      {
+        "webhook": "/webhook/macd/cross-up",
+        "is_long": false,
+        "comment": "Quick MACD reversal exit"
+      },
+      {
+        "webhook": "/webhook/rsi/crossed-down",
+        "is_long": false,
+        "comment": "RSI oversold exit"
+      }
+    ]
+  }
+}

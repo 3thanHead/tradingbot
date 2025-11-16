@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,43 @@ type TradingViewEvent struct {
 	TimeNow  string `json:"timenow"`
 }
 
+// ============================================================================
+// STRATEGY SYSTEM TYPES
+// ============================================================================
+
+// EntryStep represents a single condition in an entry sequence
+type EntryStep struct {
+	Webhook string `json:"webhook"` // Webhook URL path, e.g., "/webhook/rsi/crossed-down"
+	Comment string `json:"comment"` // Optional comment explaining the condition
+}
+
+// EntryConditions defines how entry steps combine
+type EntryConditions struct {
+	Combination string      `json:"combination"` // "all", "all_sequential", or "any"
+	Steps       []EntryStep `json:"steps"`       // List of entry steps
+}
+
+// ExitCondition represents a single exit trigger
+type ExitCondition struct {
+	Webhook string `json:"webhook"` // Webhook URL path, e.g., "/webhook/macd/cross-down"
+	IsLong  bool   `json:"is_long"` // true if this exit is for LONG positions
+	Comment string `json:"comment"` // Optional comment explaining the condition
+}
+
+// ExitConditions defines how exit conditions combine
+type ExitConditions struct {
+	Combination string          `json:"combination"` // "any" or "all"
+	Conditions  []ExitCondition `json:"conditions"`  // List of exit conditions
+}
+
+// Strategy defines complete trading strategy
+type Strategy struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Entry       EntryConditions `json:"entry"`
+	Exit        ExitConditions  `json:"exit"`
+}
+
 // Position state for each symbol
 type PositionState struct {
 	Symbol           string
@@ -39,6 +78,13 @@ type PositionState struct {
 	SwingHigh        float64 // Latest swing high price level
 	SwingLow         float64 // Latest swing low price level
 	RSICrossedCenter bool    // Tracks if RSI crossed center (first warning)
+	
+	// New: Track which entry steps have been completed
+	EntryStepsCompleted map[string]bool // Maps condition name to completion status
+	
+	// New: Track MA ribbon state
+	MARibbonBullish bool // Fast > Mid > Slow
+	MARibbonBearish bool // Fast < Mid < Slow
 }
 
 // Global state management
@@ -46,14 +92,19 @@ var (
 	positions = make(map[string]*PositionState)
 	mu        sync.RWMutex
 
-	oandaAPIKey    = os.Getenv("OANDA_API_KEY")
-	oandaAccountID = os.Getenv("OANDA_ACCOUNT_ID")
-	oandaBaseURL   = "https://api-fxpractice.oanda.com" // Change to api-fxtrade.oanda.com for live
-	tradeUnits     string                               // Trading units (fixed amount)
-	tradeUSDAmount string                               // USD notional amount (calculates units from price)
-	tradeMargin    string                               // Margin amount (OANDA calculates position size based on leverage)
-	takeProfitPips string                               // Take profit in pips (e.g., "50")
-	takeProfitPct  string                               // Take profit in percentage (e.g., "2.5" for 2.5%)
+	oandaAPIKey       = os.Getenv("OANDA_API_KEY")
+	oandaAccountID    = os.Getenv("OANDA_ACCOUNT_ID")
+	oandaBaseURL      = "https://api-fxpractice.oanda.com" // Change to api-fxtrade.oanda.com for live
+	tradeUnits        string                               // Trading units (fixed amount)
+	tradeUSDAmount    string                               // USD notional amount (calculates units from price)
+	tradeMargin       string                               // Margin amount (OANDA calculates position size based on leverage)
+	takeProfitPips    string                               // Take profit in pips (e.g., "50")
+	takeProfitPct     string                               // Take profit in percentage (e.g., "2.5" for 2.5%)
+	takeProfitDollars string                               // Take profit in dollar amount (e.g., "100" for $100 gain)
+	
+	// Strategy system
+	activeStrategy Strategy // Currently loaded strategy
+	strategyName   string   // Name of strategy file to load
 )
 
 // Get or create position state for a symbol
@@ -63,12 +114,220 @@ func getPositionState(symbol string) *PositionState {
 
 	if _, exists := positions[symbol]; !exists {
 		positions[symbol] = &PositionState{
-			Symbol:       symbol,
-			PositionOpen: false,
-			Position:     "none",
+			Symbol:              symbol,
+			PositionOpen:        false,
+			Position:            "none",
+			EntryStepsCompleted: make(map[string]bool),
 		}
 	}
 	return positions[symbol]
+}
+
+// ============================================================================
+// STRATEGY SYSTEM FUNCTIONS
+// ============================================================================
+
+// Load strategy from JSON file
+func loadStrategy(name string) (*Strategy, error) {
+	// Default to "default" if not specified
+	if name == "" {
+		name = "default"
+	}
+
+	// Build file path
+	filename := filepath.Join("strategies", name+".json")
+	
+	log.Printf("🎯 [STRATEGY] Loading: %s", filename)
+
+	// Read file
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read strategy file: %v", err)
+	}
+
+	// Parse JSON
+	var strategy Strategy
+	if err := json.Unmarshal(data, &strategy); err != nil {
+		return nil, fmt.Errorf("failed to parse strategy JSON: %v", err)
+	}
+
+	// Validate strategy
+	if err := validateStrategy(&strategy); err != nil {
+		return nil, fmt.Errorf("invalid strategy: %v", err)
+	}
+
+	log.Printf("✅ [STRATEGY] Loaded: %s", strategy.Name)
+	log.Printf("📖 [STRATEGY] %s", strategy.Description)
+	log.Printf("📊 [STRATEGY] Entry: %d steps (%s combination)",
+		len(strategy.Entry.Steps), strategy.Entry.Combination)
+	log.Printf("📊 [STRATEGY] Exit: %d conditions (%s combination)",
+		len(strategy.Exit.Conditions), strategy.Exit.Combination)
+
+	return &strategy, nil
+}
+
+// Validate strategy structure
+func validateStrategy(s *Strategy) error {
+	if s.Name == "" {
+		return fmt.Errorf("strategy name is required")
+	}
+
+	// Validate entry conditions
+	if len(s.Entry.Steps) == 0 {
+		return fmt.Errorf("entry must have at least one step")
+	}
+
+	// Validate entry combination mode
+	validCombination := map[string]bool{"all": true, "all_sequential": true, "any": true}
+	if !validCombination[s.Entry.Combination] {
+		return fmt.Errorf("invalid entry combination: %s (must be 'all', 'all_sequential', or 'any')", s.Entry.Combination)
+	}
+
+	// Validate each entry step has a webhook
+	for i, step := range s.Entry.Steps {
+		if step.Webhook == "" {
+			return fmt.Errorf("entry step %d is missing webhook path", i+1)
+		}
+	}
+
+	// Validate exit conditions
+	if len(s.Exit.Conditions) == 0 {
+		return fmt.Errorf("exit must have at least one condition")
+	}
+
+	// Validate exit combination mode
+	validExitCombination := map[string]bool{"any": true, "all": true}
+	if !validExitCombination[s.Exit.Combination] {
+		return fmt.Errorf("invalid exit combination: %s (must be 'any' or 'all')", s.Exit.Combination)
+	}
+
+	// Validate each exit condition has a webhook
+	for i, condition := range s.Exit.Conditions {
+		if condition.Webhook == "" {
+			return fmt.Errorf("exit condition %d is missing webhook path", i+1)
+		}
+	}
+
+	log.Printf("✅ [STRATEGY] Validation passed")
+	return nil
+}
+
+// Check if an entry step matches the current webhook event
+func checkEntryStepCondition(step EntryStep, r *http.Request) bool {
+	return step.Webhook == r.URL.Path
+}
+
+// Check if all entry conditions are met for opening a position
+func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
+	state := getPositionState(symbol)
+	entryConditions := activeStrategy.Entry
+
+	switch entryConditions.Combination {
+	case "all_sequential":
+		// Sequential: steps must be completed in exact order
+		for i, step := range entryConditions.Steps {
+			stepKey := fmt.Sprintf("step_%d", i)
+			
+			// If this webhook matches the current step
+			if checkEntryStepCondition(step, r) {
+				// Mark step completed
+				mu.Lock()
+				state.EntryStepsCompleted[stepKey] = true
+				mu.Unlock()
+				
+				log.Printf("✅ [STRATEGY] Entry step %d/%d completed: %s", 
+					i+1, len(entryConditions.Steps), step.Comment)
+				
+				// Check if ALL steps are now completed
+				allComplete := true
+				for j := 0; j < len(entryConditions.Steps); j++ {
+					key := fmt.Sprintf("step_%d", j)
+					if !state.EntryStepsCompleted[key] {
+						allComplete = false
+						break
+					}
+				}
+				
+				if allComplete {
+					log.Printf("🎯 [STRATEGY] All entry conditions met!")
+					// Reset steps for next trade
+					mu.Lock()
+					state.EntryStepsCompleted = make(map[string]bool)
+					mu.Unlock()
+					return true
+				}
+			}
+		}
+		return false
+		
+	case "all":
+		// All conditions must be met (order doesn't matter)
+		// Mark this step as completed
+		for i, step := range entryConditions.Steps {
+			if checkEntryStepCondition(step, r) {
+				stepKey := fmt.Sprintf("step_%d", i)
+				mu.Lock()
+				state.EntryStepsCompleted[stepKey] = true
+				mu.Unlock()
+				log.Printf("✅ [STRATEGY] Entry condition met: %s", step.Comment)
+			}
+		}
+		
+		// Check if all are completed
+		allComplete := true
+		for i := 0; i < len(entryConditions.Steps); i++ {
+			key := fmt.Sprintf("step_%d", i)
+			if !state.EntryStepsCompleted[key] {
+				allComplete = false
+				break
+			}
+		}
+		
+		if allComplete {
+			log.Printf("🎯 [STRATEGY] All simultaneous entry conditions met!")
+			mu.Lock()
+			state.EntryStepsCompleted = make(map[string]bool)
+			mu.Unlock()
+			return true
+		}
+		return false
+		
+	case "any":
+		// Any condition triggers entry
+		for _, step := range entryConditions.Steps {
+			if checkEntryStepCondition(step, r) {
+				log.Printf("🎯 [STRATEGY] Entry condition met: %s", step.Comment)
+				return true
+			}
+		}
+		return false
+	}
+	
+	return false
+}
+
+// Check if any exit condition is met
+func shouldExitPosition(symbol string, isLong bool, r *http.Request) (bool, string) {
+	exitConditions := activeStrategy.Exit
+
+	// Check each exit condition
+	for _, condition := range exitConditions.Conditions {
+		// Skip if this condition is for the opposite position type
+		if condition.IsLong != isLong {
+			continue
+		}
+		
+		// Check if this webhook matches the exit condition
+		if condition.Webhook == r.URL.Path {
+			reason := condition.Comment
+			if reason == "" {
+				reason = fmt.Sprintf("exit condition: %s", r.URL.Path)
+			}
+			return true, reason
+		}
+	}
+
+	return false, ""
 }
 
 // ============================================================================
@@ -90,27 +349,12 @@ func handleRSICrossedUp(w http.ResponseWriter, r *http.Request) {
 	eventJSON, _ := json.MarshalIndent(event, "", "  ")
 	log.Printf("📥 [REQUEST] %s", string(eventJSON))
 
-	log.Printf("📥 [DATA] Ticker: %s, Exchange: %s, Close: %s", event.Ticker, event.Exchange, event.Close)
-
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
 
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI > 70 for %s (price: %s)", symbol, event.Close)
-	log.Printf("🔍 [STATE] Before - RSICrossedUp: %v, RSICrossedDown: %v, PositionOpen: %v",
-		state.RSICrossedUp, state.RSICrossedDown, state.PositionOpen)
-
-	// Check if we should close a LONG position (RSI extreme after center cross warning)
-	if state.PositionOpen && state.Position == "long" && state.RSICrossedCenter {
-		log.Printf("⚠️ [EXIT] RSI > 70 after center cross warning → closing LONG position")
-		mu.Lock()
-		state.RSICrossedCenter = false // Reset the warning flag
-		mu.Unlock()
-		closePosition(symbol)
-		respondSuccess(w, "RSI > 70 after warning → closed LONG position")
-		return
-	}
 
 	// Set the condition flag
 	mu.Lock()
@@ -118,7 +362,24 @@ func handleRSICrossedUp(w http.ResponseWriter, r *http.Request) {
 	state.RSICrossedDown = false // Reset opposite condition
 	mu.Unlock()
 
-	log.Printf("✅ [STATE] After - RSICrossedUp: %v, RSICrossedDown: %v", state.RSICrossedUp, state.RSICrossedDown)
+	// Check if we should exit LONG position
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("RSI > 70 exit: %s → closed LONG", reason))
+			return
+		}
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "RSI > 70 + strategy → SHORT opened")
+		return
+	}
 
 	respondSuccess(w, "RSI > 70 condition set")
 }
@@ -138,27 +399,12 @@ func handleRSICrossedDown(w http.ResponseWriter, r *http.Request) {
 	eventJSON, _ := json.MarshalIndent(event, "", "  ")
 	log.Printf("📥 [REQUEST] %s", string(eventJSON))
 
-	log.Printf("📥 [DATA] Ticker: %s, Exchange: %s, Close: %s", event.Ticker, event.Exchange, event.Close)
-
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
 
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI < 30 for %s (price: %s)", symbol, event.Close)
-	log.Printf("🔍 [STATE] Before - RSICrossedUp: %v, RSICrossedDown: %v, PositionOpen: %v",
-		state.RSICrossedUp, state.RSICrossedDown, state.PositionOpen)
-
-	// Check if we should close a SHORT position (RSI extreme after center cross warning)
-	if state.PositionOpen && state.Position == "short" && state.RSICrossedCenter {
-		log.Printf("⚠️ [EXIT] RSI < 30 after center cross warning → closing SHORT position")
-		mu.Lock()
-		state.RSICrossedCenter = false // Reset the warning flag
-		mu.Unlock()
-		closePosition(symbol)
-		respondSuccess(w, "RSI < 30 after warning → closed SHORT position")
-		return
-	}
 
 	// Set the condition flag
 	mu.Lock()
@@ -166,9 +412,128 @@ func handleRSICrossedDown(w http.ResponseWriter, r *http.Request) {
 	state.RSICrossedUp = false // Reset opposite condition
 	mu.Unlock()
 
-	log.Printf("✅ [STATE] After - RSICrossedUp: %v, RSICrossedDown: %v", state.RSICrossedUp, state.RSICrossedDown)
+	// Check if we should exit SHORT position
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("RSI < 30 exit: %s → closed SHORT", reason))
+			return
+		}
+	}
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "RSI < 30 + strategy → LONG opened")
+		return
+	}
 
 	respondSuccess(w, "RSI < 30 condition set")
+}
+
+// ============================================================================
+// MA RIBBON EVENT HANDLERS
+// ============================================================================
+
+// POST /webhook/ma/ribbon-bullish
+func handleMARibbonBullish(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🔔 [WEBHOOK] Received MA Ribbon Bullish event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON in MA Ribbon Bullish: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
+
+	state := getPositionState(symbol)
+
+	log.Printf("📊 MA Ribbon BULLISH for %s (Fast > Mid > Slow)", symbol)
+
+	mu.Lock()
+	state.MARibbonBullish = true
+	state.MARibbonBearish = false
+	mu.Unlock()
+
+	// Check if should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA Ribbon bullish → LONG opened")
+		return
+	}
+
+	// Check if should close SHORT position (bearish to bullish reversal)
+	if state.PositionOpen && state.Position == "short" {
+	if takeProfitPips != "" {
+		// Calculate based on pips
+		pips := 0.0
+		if _, err := fmt.Sscanf(takeProfitPips, "%f", &pips); err != nil {
+			return "", fmt.Errorf("invalid TAKE_PROFIT_PIPS value: %v", err)
+		}
+
+		// Determine pip value based on instrument
+		// For JPY pairs (e.g., USD_JPY), 1 pip = jpyPipValue
+		// For most other pairs, 1 pip = standardPipValue
+		pipValue := standardPipValue
+		if strings.HasSuffix(symbol, "_JPY") || strings.HasPrefix(symbol, "JPY_") {
+			pipValue = jpyPipValue
+		}
+
+		pipDistance := pips * pipValue
+
+		if isLong {
+			tpPrice = entryPrice + pipDistance
+		} else {
+			tpPrice = entryPrice - pipDistance
+		}
+
+	log.Printf("🎯 [TP CALC] %.0f pips = %.5f price distance", pips, pipDistance)
+	log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, positionTypeString(isLong))
+
+	} else if takeProfitPct != "" {
+
+	symbol := normalizeSymbol(event.Ticker)
+	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
+
+	state := getPositionState(symbol)
+
+	log.Printf("📊 MA Ribbon BEARISH for %s (Fast < Mid < Slow)", symbol)
+
+	mu.Lock()
+	state.MARibbonBearish = true
+	state.MARibbonBullish = false
+	mu.Unlock()
+
+	// Check if should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA Ribbon bearish → SHORT opened")
+		return
+	}
+
+	// Check if should close LONG position (bullish to bearish reversal)
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("MA Ribbon reversal: %s → closed LONG", reason))
+			return
+		}
+	}
+
+	respondSuccess(w, "MA Ribbon bearish signal recorded")
 }
 
 // ============================================================================
@@ -198,32 +563,26 @@ func handleMACDCrossUp(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	state.MACDCrossedUp = true
 	state.MACDCrossedDown = false // Reset opposite condition
-
-	// Check if we should close a SHORT position (MACD reversal)
-	if state.PositionOpen && state.Position == "short" {
-		mu.Unlock()
-		log.Printf("⚠️ [EXIT] MACD crossed up while SHORT → reversal signal, closing position")
-		closePosition(symbol)
-		respondSuccess(w, "MACD cross up reversal → closed SHORT position")
-		return
-	}
-
-	// NEW LOGIC: If RSI < 30 condition was set, open LONG position
-	if state.RSICrossedDown && !state.PositionOpen {
-		mu.Unlock() // Unlock before opening position
-		log.Printf("🔍 [CONDITION CHECK] RSICrossedDown=true + MACDCrossedUp=true, PositionOpen=false")
-		log.Printf("✅ [TRADE] Conditions met! Opening LONG position")
-		openLongPosition(symbol, event.Close)
-
-		// Reset the RSI flag after opening position
-		mu.Lock()
-		state.RSICrossedDown = false
-		mu.Unlock()
-
-		respondSuccess(w, "MACD cross up + RSI oversold → LONG opened")
-		return
-	}
 	mu.Unlock()
+
+	// Check if we should exit SHORT position (reversal)
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("MACD cross up exit: %s → closed SHORT", reason))
+			return
+		}
+	}
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MACD cross up + strategy → LONG opened")
+		return
+	}
 
 	respondSuccess(w, "MACD cross up condition set")
 }
@@ -251,32 +610,26 @@ func handleMACDCrossDown(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	state.MACDCrossedDown = true
 	state.MACDCrossedUp = false // Reset opposite condition
-
-	// Check if we should close a LONG position (MACD reversal)
-	if state.PositionOpen && state.Position == "long" {
-		mu.Unlock()
-		log.Printf("⚠️ [EXIT] MACD crossed down while LONG → reversal signal, closing position")
-		closePosition(symbol)
-		respondSuccess(w, "MACD cross down reversal → closed LONG position")
-		return
-	}
-
-	// NEW LOGIC: If RSI > 70 condition was set, open SHORT position
-	if state.RSICrossedUp && !state.PositionOpen {
-		mu.Unlock() // Unlock before opening position
-		log.Printf("🔍 [CONDITION CHECK] RSICrossedUp=true + MACDCrossedDown=true, PositionOpen=false")
-		log.Printf("✅ [TRADE] Conditions met! Opening SHORT position")
-		openShortPosition(symbol, event.Close)
-
-		// Reset the RSI flag after opening position
-		mu.Lock()
-		state.RSICrossedUp = false
-		mu.Unlock()
-
-		respondSuccess(w, "MACD cross down + RSI overbought → SHORT opened")
-		return
-	}
 	mu.Unlock()
+
+	// Check if we should exit LONG position (reversal)
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("MACD cross down exit: %s → closed LONG", reason))
+			return
+		}
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MACD cross down + strategy → SHORT opened")
+		return
+	}
 
 	respondSuccess(w, "MACD cross down condition set")
 }
@@ -300,17 +653,14 @@ func handleRSICrossedCenter(w http.ResponseWriter, r *http.Request) {
 	eventJSON, _ := json.MarshalIndent(event, "", "  ")
 	log.Printf("📥 [REQUEST] %s", string(eventJSON))
 
-	log.Printf("📥 [DATA] Ticker: %s, Exchange: %s, Close: %s", event.Ticker, event.Exchange, event.Close)
-
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
 
 	state := getPositionState(symbol)
 
 	log.Printf("⚖️  [RSI CENTER] RSI crossed centerline (50) for %s", symbol)
-	log.Printf("🔍 [STATE] PositionOpen: %v, Position: %s, RSICrossedCenter: %v",
-		state.PositionOpen, state.Position, state.RSICrossedCenter)
 
+	// Track center cross for exit conditions
 	mu.Lock()
 	if state.PositionOpen {
 		// First center cross → Set flag and wait
@@ -321,21 +671,23 @@ func handleRSICrossedCenter(w http.ResponseWriter, r *http.Request) {
 			respondSuccess(w, "RSI crossed center (1st warning - waiting for 2nd cross or RSI extreme)")
 			return
 		}
-
-		// Second center cross → Close position
-		position := state.Position
-		state.RSICrossedCenter = false // Reset flag
-		mu.Unlock()
-		log.Printf("✅ [TRADE] Second RSI center cross! Closing %s position", strings.ToUpper(position))
-		closePosition(symbol)
-		respondSuccess(w, fmt.Sprintf("RSI crossed center (2nd time) → %s closed", strings.ToUpper(position)))
-		return
 	}
 	mu.Unlock()
 
-	log.Printf("ℹ️  [INFO] No position open for %s", symbol)
-	respondSuccess(w, "RSI crossed center (no position to close)")
-} // ============================================================================
+	// Check if we should exit position (for LONG or SHORT)
+	if state.PositionOpen {
+		isLong := state.Position == "long"
+		shouldExit, reason := shouldExitPosition(symbol, isLong, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing %s position", reason, strings.ToUpper(state.Position))
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("RSI center exit: %s → closed %s", reason, strings.ToUpper(state.Position)))
+			return
+		}
+	}
+
+	respondSuccess(w, "RSI crossed center (no exit triggered)")
+}
 // OANDA TRADING FUNCTIONS
 // ============================================================================
 
@@ -466,25 +818,40 @@ func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	return fmt.Sprintf("%d", unitsInt), nil
 }
 
-// Calculate take profit price based on pips or percentage
-func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool) (string, error) {
-	if takeProfitPips == "" && takeProfitPct == "" {
+// Helper to check which take profit method is set
+func getTakeProfitMethod() string {
+	if takeProfitPips != "" {
+		return "pips"
+	}
+	if takeProfitDollars != "" {
+		return "dollars"
+	}
+	if takeProfitPct != "" {
+		return "pct"
+	}
+	return ""
+}
+
+// Calculate take profit price based on pips, percentage, or dollar amount
+func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, units int) (string, error) {
+	if getTakeProfitMethod() == "" {
 		return "", nil // No take profit set
 	}
 
 	var tpPrice float64
 
-	if takeProfitPips != "" {
+	switch getTakeProfitMethod() {
+	case "pips":
 		// Calculate based on pips
 		pips := 0.0
 		fmt.Sscanf(takeProfitPips, "%f", &pips)
 
 		// Determine pip value based on instrument
-		// For JPY pairs (e.g., USD_JPY), 1 pip = 0.01
-		// For most other pairs, 1 pip = 0.0001
-		pipValue := 0.0001
+		// For JPY pairs (e.g., USD_JPY), 1 pip = jpyPipValue
+		// For most other pairs, 1 pip = standardPipValue
+		pipValue := standardPipValue
 		if strings.Contains(symbol, "JPY") {
-			pipValue = 0.01
+			pipValue = jpyPipValue
 		}
 
 		pipDistance := pips * pipValue
@@ -498,9 +865,31 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool) (s
 		log.Printf("🎯 [TP CALC] %.0f pips = %.5f price distance", pips, pipDistance)
 		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
 
-	} else if takeProfitPct != "" {
-		// Calculate based on percentage
-		pct := 0.0
+	case "dollars":
+		// Calculate based on dollar amount
+		dollars := 0.0
+		fmt.Sscanf(takeProfitDollars, "%f", &dollars)
+
+		// Price distance needed = dollar amount / units
+		// Example: Want $100 profit with 1000 units → need 0.1 price move (100/1000)
+		if units <= 0 {
+			return "", fmt.Errorf("invalid units for dollar-based TP calculation")
+		}
+
+		priceDistance := dollars / float64(units)
+
+		if isLong {
+			tpPrice = entryPrice + priceDistance
+		} else {
+			tpPrice = entryPrice - priceDistance
+		}
+
+		log.Printf("🎯 [TP CALC] $%.2f ÷ %d units = %.5f price distance", dollars, units, priceDistance)
+		log.Printf("🎯 [TP CALC] %.2f%% = %.5f price distance", pct, priceMove)
+		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, positionTypeString(isLong))
+	}
+		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, positionTypeString(isLong))
+	}
 		fmt.Sscanf(takeProfitPct, "%f", &pct)
 
 		priceMove := entryPrice * (pct / 100.0)
@@ -521,6 +910,8 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool) (s
 		precision = 3
 	}
 
+	return fmt.Sprintf("%.*f", precision, tpPrice), nil
+}
 	return fmt.Sprintf("%.*f", precision, tpPrice), nil
 }
 
@@ -578,11 +969,9 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 			if !isLong {
 				unitsStr = "-" + unitsStr
 			}
-			orderSpec["units"] = unitsStr
-
 			// Add take profit if configured
-			if takeProfitPips != "" || takeProfitPct != "" {
-				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong)
+			if getTakeProfitMethod() != "" {
+				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, units)
 				if err != nil {
 					log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
 				} else if tpPrice != "" {
@@ -591,6 +980,8 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 						"timeInForce": "GTC",
 					}
 					log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
+				}
+			}
 				}
 			}
 
@@ -626,16 +1017,21 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 		units = "-" + units
 	}
 
-	orderSpec["units"] = units
-
 	// Add take profit if configured
-	if takeProfitPips != "" || takeProfitPct != "" {
+	if getTakeProfitMethod() != "" {
 		// Get current price for TP calculation
 		price, err := getCurrentPrice(symbol)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get price for TP calculation: %v", err)
 		} else {
-			tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong)
+			// Parse units as integer for TP calculation
+			unitsInt := 0
+			fmt.Sscanf(units, "%d", &unitsInt)
+			if unitsInt < 0 {
+				unitsInt = -unitsInt // Make positive for calculation
+			}
+
+			tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, unitsInt)
 			if err != nil {
 				log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
 			} else if tpPrice != "" {
@@ -645,6 +1041,8 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 				}
 				log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
 			}
+		}
+	}
 		}
 	}
 
@@ -892,8 +1290,16 @@ func sendOandaOrder(orderData map[string]interface{}) (string, error) {
 					return tradeID, nil
 				}
 			}
-		}
+// Helper to convert isLong to "LONG"/"SHORT"
+func positionTypeString(isLong bool) string {
+	if isLong {
+		return "LONG"
+	}
+	return "SHORT"
+}
 
+// Get ngrok tunnel URL
+func getNgrokURL() string {
 		log.Printf("⚠️  [WARNING] Could not extract trade ID from response, using 'unknown'")
 		return "unknown", nil
 	}
@@ -986,6 +1392,13 @@ func main() {
 	// Take profit configuration
 	takeProfitPips = os.Getenv("TAKE_PROFIT_PIPS")
 	takeProfitPct = os.Getenv("TAKE_PROFIT_PCT")
+	takeProfitDollars = os.Getenv("TAKE_PROFIT_DOLLARS")
+	
+	// Strategy configuration
+	strategyName = os.Getenv("STRATEGY")
+	if strategyName == "" {
+		strategyName = "default" // Use default strategy if not specified
+	}
 
 	// Default to 100 units if nothing specified
 	if tradeUnits == "" && tradeUSDAmount == "" && tradeMargin == "" {
@@ -995,6 +1408,14 @@ func main() {
 	log.Println("🚀 TradingView Webhook Trading Bot Starting...")
 	log.Printf("📡 OANDA Account: %s", oandaAccountID)
 	log.Printf("🌐 OANDA API: %s", oandaBaseURL)
+	
+	// Load trading strategy
+	strategy, err := loadStrategy(strategyName)
+	if err != nil {
+		log.Fatalf("❌ Failed to load strategy '%s': %v", strategyName, err)
+	}
+	activeStrategy = *strategy
+	log.Printf("🚀 [STRATEGY] Active: %s", activeStrategy.Name)
 
 	// Show active trading mode
 	if tradeMargin != "" {
@@ -1013,6 +1434,8 @@ func main() {
 	// Show take profit settings
 	if takeProfitPips != "" {
 		log.Printf("🎯 Take Profit: %s pips", takeProfitPips)
+	} else if takeProfitDollars != "" {
+		log.Printf("🎯 Take Profit: $%s profit", takeProfitDollars)
 	} else if takeProfitPct != "" {
 		log.Printf("🎯 Take Profit: %s%%", takeProfitPct)
 	} else {
@@ -1034,6 +1457,10 @@ func main() {
 	http.HandleFunc("/webhook/rsi/crossed-down", handleRSICrossedDown)
 	http.HandleFunc("/webhook/rsi/crossed-center", handleRSICrossedCenter)
 
+	// MA Ribbon Webhooks
+	http.HandleFunc("/webhook/ma/ribbon-bullish", handleMARibbonBullish)
+	http.HandleFunc("/webhook/ma/ribbon-bearish", handleMARibbonBearish)
+
 	// MACD Webhooks
 	http.HandleFunc("/webhook/macd/cross-up", handleMACDCrossUp)
 	http.HandleFunc("/webhook/macd/cross-down", handleMACDCrossDown)
@@ -1045,11 +1472,13 @@ func main() {
 
 	log.Printf("✅ Server listening on port %s", port)
 	log.Println("\n📋 Webhook Endpoints:")
-	log.Println("   POST /webhook/rsi/crossed-up       (RSI > 70)")
-	log.Println("   POST /webhook/rsi/crossed-down     (RSI < 30)")
-	log.Println("   POST /webhook/rsi/crossed-center   (Close any position)")
-	log.Println("   POST /webhook/macd/cross-up        (Open LONG if RSI < 30)")
-	log.Println("   POST /webhook/macd/cross-down      (Open SHORT if RSI > 70)")
+	log.Println("   POST /webhook/rsi/crossed-up        (RSI > 70)")
+	log.Println("   POST /webhook/rsi/crossed-down      (RSI < 30)")
+	log.Println("   POST /webhook/rsi/crossed-center    (RSI crosses 50)")
+	log.Println("   POST /webhook/ma/ribbon-bullish     (MA ribbon bullish alignment)")
+	log.Println("   POST /webhook/ma/ribbon-bearish     (MA ribbon bearish alignment)")
+	log.Println("   POST /webhook/macd/cross-up         (MACD crosses up)")
+	log.Println("   POST /webhook/macd/cross-down       (MACD crosses down)")
 	log.Println("\n📊 Monitoring:")
 	log.Println("   GET /health")
 	log.Println("   GET /status")
@@ -1061,11 +1490,13 @@ func main() {
 	if ngrokURL != "" {
 		log.Printf("✅ Public ngrok URL: %s", ngrokURL)
 		log.Println("\n📱 TradingView Webhook URLs:")
-		log.Printf("   • RSI Crossed Up:     %s/webhook/rsi/crossed-up", ngrokURL)
-		log.Printf("   • RSI Crossed Down:   %s/webhook/rsi/crossed-down", ngrokURL)
-		log.Printf("   • RSI Crossed Center: %s/webhook/rsi/crossed-center", ngrokURL)
-		log.Printf("   • MACD Cross Up:      %s/webhook/macd/cross-up", ngrokURL)
-		log.Printf("   • MACD Cross Down:    %s/webhook/macd/cross-down", ngrokURL)
+		log.Printf("   • RSI Crossed Up:      %s/webhook/rsi/crossed-up", ngrokURL)
+		log.Printf("   • RSI Crossed Down:    %s/webhook/rsi/crossed-down", ngrokURL)
+		log.Printf("   • RSI Crossed Center:  %s/webhook/rsi/crossed-center", ngrokURL)
+		log.Printf("   • MA Ribbon Bullish:   %s/webhook/ma/ribbon-bullish", ngrokURL)
+		log.Printf("   • MA Ribbon Bearish:   %s/webhook/ma/ribbon-bearish", ngrokURL)
+		log.Printf("   • MACD Cross Up:       %s/webhook/macd/cross-up", ngrokURL)
+		log.Printf("   • MACD Cross Down:     %s/webhook/macd/cross-down", ngrokURL)
 		log.Println("\n🖥️  ngrok Web Interface: http://localhost:4040")
 	} else {
 		log.Println("⚠️  Could not fetch ngrok URL (ngrok may not be running)")
