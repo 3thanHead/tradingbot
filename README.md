@@ -5,15 +5,46 @@ A **simple, single-service** trading bot that receives TradingView webhook alert
 ## 🎯 How It Works
 
 ```
-TradingView Alert → Webhook → State Machine → OANDA Trade
+TradingView Alert → Webhook → Strategy System → OANDA Trade
 ```
 
-### Trading Logic (from pseudo.txt)
+### 🎨 Flexible Strategy System
 
-1. **RSI > 70** (Overbought) + **RSI Moving Down** → Open SHORT
-2. **RSI < 30** (Oversold) + **RSI Moving Up** → Open LONG  
-3. **MACD Cross Up** + **MACD Moving Up** + Short Position Open → Close SHORT
-4. **MACD Cross Down** + **MACD Moving Down** + Long Position Open → Close LONG
+**NEW:** The bot now uses a **JSON-based strategy system** that lets you define custom entry and exit conditions without changing code!
+
+Choose from built-in strategies or create your own:
+- **`default`** - Original bot behavior (RSI extremes + MACD confirmation)
+- **`ma_ribbon`** - MA ribbon trend-following strategy
+- **`scalping`** - Fast scalping with tight exits
+
+```bash
+# Set in .env file
+STRATEGY=default  # or ma_ribbon, scalping, or your-custom-strategy
+```
+
+📚 **Learn More:**
+- [Strategy Quick Start](docs/STRATEGY_QUICK_START.md) - Create your first strategy in 5 minutes
+- [Webhook Strategy System](docs/WEBHOOK_STRATEGY_SIMPLIFICATION.md) - How it works
+- [strategies/](strategies/) - View and modify example strategies
+- [Complete Documentation](docs/) - All guides and references
+
+### Default Trading Logic
+
+The `default` strategy preserves the original behavior from pseudo.txt:
+
+**Entry (Sequential - both conditions required):**
+1. **RSI < 30** (Oversold) → Set condition
+2. **MACD Cross Up** → Open LONG (if RSI was < 30)
+
+**OR**
+
+1. **RSI > 70** (Overbought) → Set condition  
+2. **MACD Cross Down** → Open SHORT (if RSI was > 70)
+
+**Exit (Any condition triggers close):**
+- **RSI Center Double-Cross** - RSI crosses 50 twice in same direction
+- **MACD Reversal** - MACD crosses opposite direction
+- **RSI Extreme After Warning** - RSI hits opposite extreme after center cross
 
 ## 🚀 Quick Start
 
@@ -21,7 +52,7 @@ TradingView Alert → Webhook → State Machine → OANDA Trade
 
 Get a free ngrok auth token from https://dashboard.ngrok.com/signup
 
-**Optional but RECOMMENDED:** Get a [free static domain](https://dashboard.ngrok.com/domains) so your webhook URL never changes! See [NGROK_STATIC_DOMAIN.md](NGROK_STATIC_DOMAIN.md) for setup.
+**Optional but RECOMMENDED:** Get a [free static domain](https://dashboard.ngrok.com/domains) so your webhook URL never changes! See [docs/NGROK_STATIC_DOMAIN.md](docs/NGROK_STATIC_DOMAIN.md) for setup.
 
 ```bash
 cp .env.example .env
@@ -65,12 +96,13 @@ Only starts the bot on `localhost:8080` without public exposure.
 
 ### 3. Configure TradingView Alerts
 
-Set up **8 separate alerts** in TradingView:
+Set up **7 webhook alerts** in TradingView (8 if using MA ribbon strategy):
 
-#### RSI Alerts (4 alerts)
+#### RSI Alerts (3 alerts)
 
-**Alert 1: RSI > 70**
-- Webhook URL: `http://your-server:8080/webhook/rsi/greater-than-70`
+**Alert 1: RSI Crossed Above 70**
+- Condition: `RSI crosses above 70`
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/rsi/crossed-up`
 - Message:
 ```json
 {
@@ -87,50 +119,55 @@ Set up **8 separate alerts** in TradingView:
 }
 ```
 
-**Alert 2: RSI < 30**
-- Webhook URL: `http://your-server:8080/webhook/rsi/less-than-30`
+**Alert 2: RSI Crossed Below 30**
+- Condition: `RSI crosses below 30`
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/rsi/crossed-down`
 - Message: Same JSON as above
 
-**Alert 3: RSI Moving Down**
-- Webhook URL: `http://your-server:8080/webhook/rsi/moving-down`
+**Alert 3: RSI Crossed 50 (Center)**
+- Condition: `RSI crosses 50` (both directions)
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/rsi/crossed-center`
 - Message: Same JSON as above
 
-**Alert 4: RSI Moving Up**
-- Webhook URL: `http://your-server:8080/webhook/rsi/moving-up`
-- Message: Same JSON as above
+#### MACD Alerts (2 alerts)
 
-#### MACD Alerts (4 alerts)
-
-**Alert 5: MACD Cross Above Zero**
-- Webhook URL: `http://your-server:8080/webhook/macd/cross-up`
+**Alert 4: MACD Line Crossed Above Signal**
+- Condition: `MACD line crosses above signal line`
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/macd/cross-up`
 - Message: Same JSON format
 
-**Alert 6: MACD Cross Below Zero**
-- Webhook URL: `http://your-server:8080/webhook/macd/cross-down`
+**Alert 5: MACD Line Crossed Below Signal**
+- Condition: `MACD line crosses below signal line`
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/macd/cross-down`
 - Message: Same JSON format
 
-**Alert 7: MACD Moving Up**
-- Webhook URL: `http://your-server:8080/webhook/macd/moving-up`
+#### MA Ribbon Alerts (2 alerts - OPTIONAL, for `ma_ribbon` strategy)
+
+**Alert 6: All MAs Bullish Aligned**
+- Condition: `MA(5) > MA(10) > MA(20) > MA(50) > MA(100)`
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/ma/ribbon-bullish`
 - Message: Same JSON format
 
-**Alert 8: MACD Moving Down**
-- Webhook URL: `http://your-server:8080/webhook/macd/moving-down`
+**Alert 7: All MAs Bearish Aligned**
+- Condition: `MA(5) < MA(10) < MA(20) < MA(50) < MA(100)`
+- Webhook URL: `https://your-domain.ngrok-free.app/webhook/ma/ribbon-bearish`
 - Message: Same JSON format
 
 ## 📡 API Endpoints
 
 ### Webhook Endpoints (POST)
 
-| Endpoint | Event | Purpose |
-|----------|-------|---------|
-| `/webhook/rsi/greater-than-70` | RSI > 70 | Set overbought condition |
-| `/webhook/rsi/less-than-30` | RSI < 30 | Set oversold condition |
-| `/webhook/rsi/moving-down` | RSI ↓ | Trigger SHORT if RSI was > 70 |
-| `/webhook/rsi/moving-up` | RSI ↑ | Trigger LONG if RSI was < 30 |
-| `/webhook/macd/cross-up` | MACD crosses up | Set bullish condition |
-| `/webhook/macd/cross-down` | MACD crosses down | Set bearish condition |
-| `/webhook/macd/moving-up` | MACD ↑ | Close SHORT if MACD crossed up |
-| `/webhook/macd/moving-down` | MACD ↓ | Close LONG if MACD crossed down |
+| Endpoint | Event | Strategy Condition |
+|----------|-------|-------------------|
+| `/webhook/rsi/crossed-up` | RSI crosses above 70 | `rsi_crossed_up` |
+| `/webhook/rsi/crossed-down` | RSI crosses below 30 | `rsi_crossed_down` |
+| `/webhook/rsi/crossed-center` | RSI crosses 50 (both ways) | `rsi_crossed_center` |
+| `/webhook/macd/cross-up` | MACD line crosses above signal | `macd_cross_up` |
+| `/webhook/macd/cross-down` | MACD line crosses below signal | `macd_cross_down` |
+| `/webhook/ma/ribbon-bullish` | All MAs bullish aligned | `ma_ribbon_bullish` |
+| `/webhook/ma/ribbon-bearish` | All MAs bearish aligned | `ma_ribbon_bearish` |
+
+**Note:** The bot's behavior depends on your active strategy (see [Strategy System](#-flexible-strategy-system))
 
 ### Monitoring Endpoints (GET)
 
@@ -215,19 +252,34 @@ See [MARGIN_AMOUNT.md](MARGIN_AMOUNT.md) for detailed explanation.
 
 ### Take Profit
 
-Set automatic take profit in pips or percentage:
+Set automatic take profit using pips, dollars, or percentage:
 
-**Pips:**
+**Pips (Highest Priority):**
 ```bash
 TAKE_PROFIT_PIPS=50  # 50 pip take profit
 ```
 
-**Percentage:**
+**Dollar Amount:**
+```bash
+TAKE_PROFIT_DOLLARS=100  # $100 profit target
+```
+
+**Percentage (Lowest Priority):**
 ```bash
 TAKE_PROFIT_PCT=2.5  # 2.5% gain take profit
 ```
 
-See [TAKE_PROFIT.md](TAKE_PROFIT.md) for detailed examples and configuration.
+See [docs/TAKE_PROFIT.md](docs/TAKE_PROFIT.md) for detailed examples and configuration.
+
+### Strategy Selection
+
+Choose your trading strategy:
+
+```bash
+STRATEGY=default  # default, ma_ribbon, scalping, or custom
+```
+
+See [Strategy System Guide](STRATEGY_SYSTEM.md) for creating custom strategies.
 
 ### Switch to Live Trading
 
@@ -242,13 +294,28 @@ oandaBaseURL = "https://api-fxtrade.oanda.com"  // Change from api-fxpractice
 
 ```
 trader_bot/
-├── main.go              # Single service with all logic
-├── Dockerfile           # Docker build
-├── docker-compose.yml   # Easy deployment
-├── .env.example         # Environment template
+├── main.go                      # Core trading bot with strategy system
+├── Dockerfile                   # Docker build
+├── docker-compose.yml           # Easy deployment
+├── .env.example                 # Environment template
+├── strategies/                  # Trading strategy definitions
+│   ├── README.md               # Strategy directory guide
+│   ├── default.json            # Original bot behavior
+│   ├── ma_ribbon.json          # MA ribbon trend-following
+│   └── scalping.json           # Fast scalping strategy
+├── docs/                        # Complete documentation
+│   ├── README.md               # Documentation index
+│   ├── STRATEGY_QUICK_START.md # 5-minute strategy guide
+│   ├── WEBHOOK_STRATEGY_SIMPLIFICATION.md # Strategy system explanation
+│   ├── TAKE_PROFIT.md          # Take profit configuration
+│   ├── NGROK_STATIC_DOMAIN.md  # Static domain setup
+│   ├── TRADINGVIEW_ALERTS.md   # TradingView setup guide
+│   ├── CHANGELOG.md            # Version history
+│   ├── MIGRATION_TO_V2.md      # Upgrade guide
+│   └── ... (more guides)
 ├── data/
-│   └── trading_view_event.json  # Webhook payload format
-└── pseudo.txt           # Original trading logic
+│   └── trading_view_event.json # Webhook payload format
+└── pseudo.txt                   # Original trading logic
 ```
 
 ## 🔒 Security

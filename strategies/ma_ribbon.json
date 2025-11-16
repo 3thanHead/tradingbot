@@ -1,0 +1,32 @@
+{
+  "name": "ma_ribbon",
+  "description": "MA ribbon trend-following - enter when all MAs align, exit on ribbon reversal",
+  "entry": {
+    "combination": "all",
+    "steps": [
+      {
+        "webhook": "/webhook/ma/ribbon-bullish",
+        "comment": "All MAs aligned bullish (5>10>20>50>100)"
+      },
+      {
+        "webhook": "/webhook/macd/cross-up",
+        "comment": "MACD confirms bullish momentum"
+      }
+    ]
+  },
+  "exit": {
+    "combination": "any",
+    "conditions": [
+      {
+        "webhook": "/webhook/ma/ribbon-bearish",
+        "is_long": true,
+        "comment": "MA ribbon reverses bearish"
+      },
+      {
+        "webhook": "/webhook/ma/ribbon-bullish",
+        "is_long": false,
+        "comment": "MA ribbon reverses bullish"
+      }
+    ]
+  }
+}

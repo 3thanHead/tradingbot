@@ -1,6 +1,6 @@
 # Take Profit Configuration
 
-The trading bot now supports automatic take profit orders with two different calculation methods: **pips** or **percentage**.
+The trading bot now supports automatic take profit orders with three different calculation methods: **pips**, **percentage**, or **dollar amount**.
 
 ## Configuration
 
@@ -19,7 +19,21 @@ TAKE_PROFIT_PIPS=50
 - LONG EUR_USD at 1.0850 with `TAKE_PROFIT_PIPS=50`
 - Take profit will be set at: 1.0850 + (50 × 0.0001) = **1.0900**
 
-### Option 2: Take Profit in Percentage
+### Option 2: Take Profit in Dollar Amount
+
+```bash
+TAKE_PROFIT_DOLLARS=100
+```
+
+- Set exact dollar profit target
+- Automatically calculates required price move based on position size
+
+**Example:**
+- LONG 1000 units EUR_USD at 1.0850 with `TAKE_PROFIT_DOLLARS=100`
+- Price distance needed: $100 ÷ 1000 units = 0.1
+- Take profit will be set at: 1.0850 + 0.1 = **1.0950**
+
+### Option 3: Take Profit in Percentage
 
 ```bash
 TAKE_PROFIT_PCT=2.5
@@ -34,12 +48,15 @@ TAKE_PROFIT_PCT=2.5
 
 ## Priority
 
-If both are set, **TAKE_PROFIT_PIPS** takes priority over **TAKE_PROFIT_PCT**.
+If multiple are set, priority order is:
+1. **TAKE_PROFIT_PIPS** (highest priority)
+2. **TAKE_PROFIT_DOLLARS**
+3. **TAKE_PROFIT_PCT** (lowest priority)
 
 ## Disable Take Profit
 
 To disable automatic take profit:
-- Don't set either variable, or
+- Don't set any of the variables, or
 - Set them to empty string: `TAKE_PROFIT_PIPS=`
 
 ## How It Works
@@ -65,6 +82,12 @@ MARGIN_AMOUNT=100
 TAKE_PROFIT_PIPS=20
 ```
 
+### Fixed Dollar Target ($50 profit)
+```bash
+MARGIN_AMOUNT=100
+TAKE_PROFIT_DOLLARS=50
+```
+
 ### Aggressive Strategy (5% gain)
 ```bash
 MARGIN_AMOUNT=500
@@ -80,10 +103,26 @@ TAKE_PROFIT_PIPS=10
 ## Logging
 
 When a position opens, you'll see logs like:
+
+**Pips-based:**
 ```
 🎯 [TP CALC] 50 pips = 0.00500 price distance
 🎯 [TP CALC] Entry: 1.08500 → TP: 1.09000 (LONG)
 🎯 [TP] Take profit set at 1.09000
+```
+
+**Dollar-based:**
+```
+🎯 [TP CALC] $100.00 ÷ 1000 units = 0.10000 price distance
+🎯 [TP CALC] Entry: 1.08500 → TP: 1.18500 (LONG)
+🎯 [TP] Take profit set at 1.18500
+```
+
+**Percentage-based:**
+```
+🎯 [TP CALC] 2.50% = 0.02713 price distance
+🎯 [TP CALC] Entry: 1.08500 → TP: 1.11213 (LONG)
+🎯 [TP] Take profit set at 1.11213
 ```
 
 ## Trade Lifecycle with Take Profit
