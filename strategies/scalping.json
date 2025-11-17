@@ -19,23 +19,19 @@
     "conditions": [
       {
         "webhook": "/webhook/macd/cross-down",
-        "is_long": true,
-        "comment": "Quick MACD reversal exit"
-      },
-      {
-        "webhook": "/webhook/rsi/crossed-up",
-        "is_long": true,
-        "comment": "RSI overbought exit"
+        "comment": "MACD reversal (bearish)"
       },
       {
         "webhook": "/webhook/macd/cross-up",
-        "is_long": false,
-        "comment": "Quick MACD reversal exit"
+        "comment": "MACD reversal (bullish)"
+      },
+      {
+        "webhook": "/webhook/rsi/crossed-up",
+        "comment": "RSI overbought"
       },
       {
         "webhook": "/webhook/rsi/crossed-down",
-        "is_long": false,
-        "comment": "RSI oversold exit"
+        "comment": "RSI oversold"
       }
     ]
   }

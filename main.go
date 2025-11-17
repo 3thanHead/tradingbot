@@ -31,30 +31,39 @@ type TradingViewEvent struct {
 // ============================================================================
 // STRATEGY SYSTEM TYPES
 // ============================================================================
+//
+// NAMING CONVENTION:
+// - Entry uses "steps" (can be sequential: step 1 → step 2 → step 3)
+// - Exit uses "conditions" (usually independent triggers)
+// Both are essentially webhook triggers, just named differently for clarity.
+// ============================================================================
 
-// EntryStep represents a single condition in an entry sequence
+// EntryStep represents a single webhook trigger for entering a position
+// Called "step" because entries can be sequential (wait for step 1, then step 2, etc.)
 type EntryStep struct {
 	Webhook string `json:"webhook"` // Webhook URL path, e.g., "/webhook/rsi/crossed-down"
-	Comment string `json:"comment"` // Optional comment explaining the condition
+	Comment string `json:"comment"` // Optional human-readable description
 }
 
-// EntryConditions defines how entry steps combine
+// EntryConditions defines how entry steps combine to trigger a trade
 type EntryConditions struct {
-	Combination string      `json:"combination"` // "all", "all_sequential", or "any"
-	Steps       []EntryStep `json:"steps"`       // List of entry steps
+	Combination string      `json:"combination"` // How to combine: "all", "all_sequential", or "any"
+	Steps       []EntryStep `json:"steps"`       // Array of webhook triggers for entry
 }
 
-// ExitCondition represents a single exit trigger
+// ExitCondition represents a single webhook trigger for exiting a position
+// Called "condition" because exits are usually independent triggers (any can close)
+// ExitCondition defines a webhook that can trigger position exit
+// Position direction (LONG/SHORT) is determined from the actual OANDA position
 type ExitCondition struct {
 	Webhook string `json:"webhook"` // Webhook URL path, e.g., "/webhook/macd/cross-down"
-	IsLong  bool   `json:"is_long"` // true if this exit is for LONG positions
-	Comment string `json:"comment"` // Optional comment explaining the condition
+	Comment string `json:"comment"` // Optional human-readable description
 }
 
-// ExitConditions defines how exit conditions combine
+// ExitConditions defines how exit conditions combine to close a position
 type ExitConditions struct {
-	Combination string          `json:"combination"` // "any" or "all"
-	Conditions  []ExitCondition `json:"conditions"`  // List of exit conditions
+	Combination string          `json:"combination"` // How to combine: "any" (typical) or "all" (rare)
+	Conditions  []ExitCondition `json:"conditions"`  // Array of webhook triggers for exit
 }
 
 // Strategy defines complete trading strategy
@@ -78,11 +87,11 @@ type PositionState struct {
 	SwingHigh        float64 // Latest swing high price level
 	SwingLow         float64 // Latest swing low price level
 	RSICrossedCenter bool    // Tracks if RSI crossed center (first warning)
-	
-	// New: Track which entry steps have been completed
-	EntryStepsCompleted map[string]bool // Maps condition name to completion status
-	
-	// New: Track MA ribbon state
+
+	// Track which entry steps have been completed
+	EntryStepsCompleted map[string]bool // Maps step index to completion status
+
+	// Track MA ribbon state
 	MARibbonBullish bool // Fast > Mid > Slow
 	MARibbonBearish bool // Fast < Mid < Slow
 }
@@ -101,7 +110,7 @@ var (
 	takeProfitPips    string                               // Take profit in pips (e.g., "50")
 	takeProfitPct     string                               // Take profit in percentage (e.g., "2.5" for 2.5%)
 	takeProfitDollars string                               // Take profit in dollar amount (e.g., "100" for $100 gain)
-	
+
 	// Strategy system
 	activeStrategy Strategy // Currently loaded strategy
 	strategyName   string   // Name of strategy file to load
@@ -136,7 +145,7 @@ func loadStrategy(name string) (*Strategy, error) {
 
 	// Build file path
 	filename := filepath.Join("strategies", name+".json")
-	
+
 	log.Printf("🎯 [STRATEGY] Loading: %s", filename)
 
 	// Read file
@@ -212,11 +221,6 @@ func validateStrategy(s *Strategy) error {
 	return nil
 }
 
-// Check if an entry step matches the current webhook event
-func checkEntryStepCondition(step EntryStep, r *http.Request) bool {
-	return step.Webhook == r.URL.Path
-}
-
 // Check if all entry conditions are met for opening a position
 func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 	state := getPositionState(symbol)
@@ -227,17 +231,17 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 		// Sequential: steps must be completed in exact order
 		for i, step := range entryConditions.Steps {
 			stepKey := fmt.Sprintf("step_%d", i)
-			
+
 			// If this webhook matches the current step
-			if checkEntryStepCondition(step, r) {
+			if step.Webhook == r.URL.Path {
 				// Mark step completed
 				mu.Lock()
 				state.EntryStepsCompleted[stepKey] = true
 				mu.Unlock()
-				
-				log.Printf("✅ [STRATEGY] Entry step %d/%d completed: %s", 
+
+				log.Printf("✅ [STRATEGY] Entry step %d/%d completed: %s",
 					i+1, len(entryConditions.Steps), step.Comment)
-				
+
 				// Check if ALL steps are now completed
 				allComplete := true
 				for j := 0; j < len(entryConditions.Steps); j++ {
@@ -247,7 +251,7 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 						break
 					}
 				}
-				
+
 				if allComplete {
 					log.Printf("🎯 [STRATEGY] All entry conditions met!")
 					// Reset steps for next trade
@@ -259,12 +263,12 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 			}
 		}
 		return false
-		
+
 	case "all":
 		// All conditions must be met (order doesn't matter)
 		// Mark this step as completed
 		for i, step := range entryConditions.Steps {
-			if checkEntryStepCondition(step, r) {
+			if step.Webhook == r.URL.Path {
 				stepKey := fmt.Sprintf("step_%d", i)
 				mu.Lock()
 				state.EntryStepsCompleted[stepKey] = true
@@ -272,7 +276,7 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 				log.Printf("✅ [STRATEGY] Entry condition met: %s", step.Comment)
 			}
 		}
-		
+
 		// Check if all are completed
 		allComplete := true
 		for i := 0; i < len(entryConditions.Steps); i++ {
@@ -282,7 +286,7 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 				break
 			}
 		}
-		
+
 		if allComplete {
 			log.Printf("🎯 [STRATEGY] All simultaneous entry conditions met!")
 			mu.Lock()
@@ -291,18 +295,18 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 			return true
 		}
 		return false
-		
+
 	case "any":
 		// Any condition triggers entry
 		for _, step := range entryConditions.Steps {
-			if checkEntryStepCondition(step, r) {
+			if step.Webhook == r.URL.Path {
 				log.Printf("🎯 [STRATEGY] Entry condition met: %s", step.Comment)
 				return true
 			}
 		}
 		return false
 	}
-	
+
 	return false
 }
 
@@ -311,12 +315,8 @@ func shouldExitPosition(symbol string, isLong bool, r *http.Request) (bool, stri
 	exitConditions := activeStrategy.Exit
 
 	// Check each exit condition
+	// Note: Position direction (isLong) comes from OANDA, not the strategy JSON
 	for _, condition := range exitConditions.Conditions {
-		// Skip if this condition is for the opposite position type
-		if condition.IsLong != isLong {
-			continue
-		}
-		
 		// Check if this webhook matches the exit condition
 		if condition.Webhook == r.URL.Path {
 			reason := condition.Comment
@@ -348,6 +348,8 @@ func handleRSICrossedUp(w http.ResponseWriter, r *http.Request) {
 	// Log the full request
 	eventJSON, _ := json.MarshalIndent(event, "", "  ")
 	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	log.Printf("📥 [DATA] Ticker: %s, Exchange: %s, Close: %s", event.Ticker, event.Exchange, event.Close)
 
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
@@ -398,6 +400,8 @@ func handleRSICrossedDown(w http.ResponseWriter, r *http.Request) {
 	// Log the full request
 	eventJSON, _ := json.MarshalIndent(event, "", "  ")
 	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	log.Printf("📥 [DATA] Ticker: %s, Exchange: %s, Close: %s", event.Ticker, event.Exchange, event.Close)
 
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
@@ -474,33 +478,31 @@ func handleMARibbonBullish(w http.ResponseWriter, r *http.Request) {
 
 	// Check if should close SHORT position (bearish to bullish reversal)
 	if state.PositionOpen && state.Position == "short" {
-	if takeProfitPips != "" {
-		// Calculate based on pips
-		pips := 0.0
-		if _, err := fmt.Sscanf(takeProfitPips, "%f", &pips); err != nil {
-			return "", fmt.Errorf("invalid TAKE_PROFIT_PIPS value: %v", err)
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("MA Ribbon reversal: %s → closed SHORT", reason))
+			return
 		}
+	}
 
-		// Determine pip value based on instrument
-		// For JPY pairs (e.g., USD_JPY), 1 pip = jpyPipValue
-		// For most other pairs, 1 pip = standardPipValue
-		pipValue := standardPipValue
-		if strings.HasSuffix(symbol, "_JPY") || strings.HasPrefix(symbol, "JPY_") {
-			pipValue = jpyPipValue
-		}
+	respondSuccess(w, "MA Ribbon bullish signal recorded")
+}
 
-		pipDistance := pips * pipValue
+// POST /webhook/ma/ribbon-bearish
+func handleMARibbonBearish(w http.ResponseWriter, r *http.Request) {
+	log.Printf("🔔 [WEBHOOK] Received MA Ribbon Bearish event")
 
-		if isLong {
-			tpPrice = entryPrice + pipDistance
-		} else {
-			tpPrice = entryPrice - pipDistance
-		}
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON in MA Ribbon Bearish: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
 
-	log.Printf("🎯 [TP CALC] %.0f pips = %.5f price distance", pips, pipDistance)
-	log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, positionTypeString(isLong))
-
-	} else if takeProfitPct != "" {
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
 
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
@@ -653,6 +655,8 @@ func handleRSICrossedCenter(w http.ResponseWriter, r *http.Request) {
 	eventJSON, _ := json.MarshalIndent(event, "", "  ")
 	log.Printf("📥 [REQUEST] %s", string(eventJSON))
 
+	log.Printf("📥 [DATA] Ticker: %s, Exchange: %s, Close: %s", event.Ticker, event.Exchange, event.Close)
+
 	symbol := normalizeSymbol(event.Ticker)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
 
@@ -687,7 +691,7 @@ func handleRSICrossedCenter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondSuccess(w, "RSI crossed center (no exit triggered)")
-}
+} // ============================================================================
 // OANDA TRADING FUNCTIONS
 // ============================================================================
 
@@ -818,40 +822,25 @@ func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	return fmt.Sprintf("%d", unitsInt), nil
 }
 
-// Helper to check which take profit method is set
-func getTakeProfitMethod() string {
-	if takeProfitPips != "" {
-		return "pips"
-	}
-	if takeProfitDollars != "" {
-		return "dollars"
-	}
-	if takeProfitPct != "" {
-		return "pct"
-	}
-	return ""
-}
-
-// Calculate take profit price based on pips, percentage, or dollar amount
-func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, units int) (string, error) {
-	if getTakeProfitMethod() == "" {
+// Calculate take profit price based on pips or percentage
+func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool) (string, error) {
+	if takeProfitPips == "" && takeProfitPct == "" {
 		return "", nil // No take profit set
 	}
 
 	var tpPrice float64
 
-	switch getTakeProfitMethod() {
-	case "pips":
+	if takeProfitPips != "" {
 		// Calculate based on pips
 		pips := 0.0
 		fmt.Sscanf(takeProfitPips, "%f", &pips)
 
 		// Determine pip value based on instrument
-		// For JPY pairs (e.g., USD_JPY), 1 pip = jpyPipValue
-		// For most other pairs, 1 pip = standardPipValue
-		pipValue := standardPipValue
+		// For JPY pairs (e.g., USD_JPY), 1 pip = 0.01
+		// For most other pairs, 1 pip = 0.0001
+		pipValue := 0.0001
 		if strings.Contains(symbol, "JPY") {
-			pipValue = jpyPipValue
+			pipValue = 0.01
 		}
 
 		pipDistance := pips * pipValue
@@ -865,31 +854,9 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, un
 		log.Printf("🎯 [TP CALC] %.0f pips = %.5f price distance", pips, pipDistance)
 		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
 
-	case "dollars":
-		// Calculate based on dollar amount
-		dollars := 0.0
-		fmt.Sscanf(takeProfitDollars, "%f", &dollars)
-
-		// Price distance needed = dollar amount / units
-		// Example: Want $100 profit with 1000 units → need 0.1 price move (100/1000)
-		if units <= 0 {
-			return "", fmt.Errorf("invalid units for dollar-based TP calculation")
-		}
-
-		priceDistance := dollars / float64(units)
-
-		if isLong {
-			tpPrice = entryPrice + priceDistance
-		} else {
-			tpPrice = entryPrice - priceDistance
-		}
-
-		log.Printf("🎯 [TP CALC] $%.2f ÷ %d units = %.5f price distance", dollars, units, priceDistance)
-		log.Printf("🎯 [TP CALC] %.2f%% = %.5f price distance", pct, priceMove)
-		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, positionTypeString(isLong))
-	}
-		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, positionTypeString(isLong))
-	}
+	} else if takeProfitPct != "" {
+		// Calculate based on percentage
+		pct := 0.0
 		fmt.Sscanf(takeProfitPct, "%f", &pct)
 
 		priceMove := entryPrice * (pct / 100.0)
@@ -910,8 +877,6 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, un
 		precision = 3
 	}
 
-	return fmt.Sprintf("%.*f", precision, tpPrice), nil
-}
 	return fmt.Sprintf("%.*f", precision, tpPrice), nil
 }
 
@@ -969,9 +934,11 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 			if !isLong {
 				unitsStr = "-" + unitsStr
 			}
+			orderSpec["units"] = unitsStr
+
 			// Add take profit if configured
-			if getTakeProfitMethod() != "" {
-				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, units)
+			if takeProfitPips != "" || takeProfitPct != "" {
+				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong)
 				if err != nil {
 					log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
 				} else if tpPrice != "" {
@@ -980,8 +947,6 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 						"timeInForce": "GTC",
 					}
 					log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
-				}
-			}
 				}
 			}
 
@@ -1017,21 +982,16 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 		units = "-" + units
 	}
 
+	orderSpec["units"] = units
+
 	// Add take profit if configured
-	if getTakeProfitMethod() != "" {
+	if takeProfitPips != "" || takeProfitPct != "" {
 		// Get current price for TP calculation
 		price, err := getCurrentPrice(symbol)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get price for TP calculation: %v", err)
 		} else {
-			// Parse units as integer for TP calculation
-			unitsInt := 0
-			fmt.Sscanf(units, "%d", &unitsInt)
-			if unitsInt < 0 {
-				unitsInt = -unitsInt // Make positive for calculation
-			}
-
-			tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, unitsInt)
+			tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong)
 			if err != nil {
 				log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
 			} else if tpPrice != "" {
@@ -1041,8 +1001,6 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 				}
 				log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
 			}
-		}
-	}
 		}
 	}
 
@@ -1290,16 +1248,8 @@ func sendOandaOrder(orderData map[string]interface{}) (string, error) {
 					return tradeID, nil
 				}
 			}
-// Helper to convert isLong to "LONG"/"SHORT"
-func positionTypeString(isLong bool) string {
-	if isLong {
-		return "LONG"
-	}
-	return "SHORT"
-}
+		}
 
-// Get ngrok tunnel URL
-func getNgrokURL() string {
 		log.Printf("⚠️  [WARNING] Could not extract trade ID from response, using 'unknown'")
 		return "unknown", nil
 	}
@@ -1393,7 +1343,7 @@ func main() {
 	takeProfitPips = os.Getenv("TAKE_PROFIT_PIPS")
 	takeProfitPct = os.Getenv("TAKE_PROFIT_PCT")
 	takeProfitDollars = os.Getenv("TAKE_PROFIT_DOLLARS")
-	
+
 	// Strategy configuration
 	strategyName = os.Getenv("STRATEGY")
 	if strategyName == "" {
@@ -1408,7 +1358,7 @@ func main() {
 	log.Println("🚀 TradingView Webhook Trading Bot Starting...")
 	log.Printf("📡 OANDA Account: %s", oandaAccountID)
 	log.Printf("🌐 OANDA API: %s", oandaBaseURL)
-	
+
 	// Load trading strategy
 	strategy, err := loadStrategy(strategyName)
 	if err != nil {
@@ -1434,8 +1384,6 @@ func main() {
 	// Show take profit settings
 	if takeProfitPips != "" {
 		log.Printf("🎯 Take Profit: %s pips", takeProfitPips)
-	} else if takeProfitDollars != "" {
-		log.Printf("🎯 Take Profit: $%s profit", takeProfitDollars)
 	} else if takeProfitPct != "" {
 		log.Printf("🎯 Take Profit: %s%%", takeProfitPct)
 	} else {

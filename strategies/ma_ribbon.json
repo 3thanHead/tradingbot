@@ -19,12 +19,10 @@
     "conditions": [
       {
         "webhook": "/webhook/ma/ribbon-bearish",
-        "is_long": true,
         "comment": "MA ribbon reverses bearish"
       },
       {
         "webhook": "/webhook/ma/ribbon-bullish",
-        "is_long": false,
         "comment": "MA ribbon reverses bullish"
       }
     ]
