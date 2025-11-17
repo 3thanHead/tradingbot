@@ -1,16 +1,16 @@
 {
   "name": "default",
-  "description": "Original bot behavior - RSI extremes + MACD confirmation with multiple exit conditions",
+  "description": "MACD momentum + RSI confirmation - exits on opposite RSI extreme",
   "entry": {
-    "combination": "all_sequential",
-    "steps": [
+    "combination": "all",
+    "conditions": [
       {
         "webhook": "/webhook/rsi/crossed-down",
-        "comment": "RSI crosses below 30 (oversold)"
+        "comment": "RSI oversold (preparing for LONG)"
       },
       {
         "webhook": "/webhook/macd/cross-up",
-        "comment": "MACD line crosses above signal"
+        "comment": "MACD bullish crossover"
       }
     ]
   },
@@ -18,24 +18,12 @@
     "combination": "any",
     "conditions": [
       {
-        "webhook": "/webhook/rsi/crossed-center",
-        "comment": "RSI crosses 50 (double-cross exit)"
-      },
-      {
-        "webhook": "/webhook/macd/cross-down",
-        "comment": "MACD reversal (bearish)"
-      },
-      {
-        "webhook": "/webhook/macd/cross-up",
-        "comment": "MACD reversal (bullish)"
-      },
-      {
         "webhook": "/webhook/rsi/crossed-up",
-        "comment": "RSI extreme (overbought)"
+        "comment": "Exit LONG when RSI overbought (>70)"
       },
       {
         "webhook": "/webhook/rsi/crossed-down",
-        "comment": "RSI extreme (oversold)"
+        "comment": "Exit SHORT when RSI oversold (<30)"
       }
     ]
   }

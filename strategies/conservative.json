@@ -1,0 +1,60 @@
+{
+  "name": "conservative",
+  "description": "Conservative strategy - wider RSI levels (25/75) for higher probability trades",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD bullish crossover"
+        },
+        {
+          "webhook": "/webhook/rsi/crossed-down",
+          "comment": "RSI deeply oversold (<25) - higher probability reversal"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "webhook": "/webhook/rsi/crossed-up",
+          "comment": "Exit LONG at RSI >75 (deep overbought)"
+        },
+        {
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "Exit on MACD reversal"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD bearish crossover"
+        },
+        {
+          "webhook": "/webhook/rsi/crossed-up",
+          "comment": "RSI deeply overbought (>75) - higher probability reversal"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "webhook": "/webhook/rsi/crossed-down",
+          "comment": "Exit SHORT at RSI <25 (deep oversold)"
+        },
+        {
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "Exit on MACD reversal"
+        }
+      ]
+    }
+  }
+}
