@@ -3,7 +3,7 @@
   "description": "MACD momentum + RSI confirmation - exits on opposite RSI extreme",
   "entry": {
     "combination": "all",
-    "steps": [
+    "conditions": [
       {
         "webhook": "/webhook/rsi/crossed-down",
         "comment": "RSI oversold (preparing for LONG)"

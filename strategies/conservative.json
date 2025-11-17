@@ -4,7 +4,7 @@
   "long": {
     "entry": {
       "combination": "all",
-      "steps": [
+      "conditions": [
         {
           "webhook": "/webhook/macd/cross-up",
           "comment": "MACD bullish crossover"
@@ -32,7 +32,7 @@
   "short": {
     "entry": {
       "combination": "all",
-      "steps": [
+      "conditions": [
         {
           "webhook": "/webhook/macd/cross-down",
           "comment": "MACD bearish crossover"

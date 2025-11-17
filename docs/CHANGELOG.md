@@ -20,7 +20,7 @@
 ### Strategy System (v2.0)
 - **JSON-based strategies**: Edit JSON files to change trading logic without coding
 - **3 built-in strategies**: default, ma_ribbon, scalping
-- **Combination modes**: all_sequential, all, any
+- **Combination modes**: sequential, all, any
 - **7 webhook endpoints**: RSI (3), MACD (2), MA Ribbon (2)
 - **Environment variable**: `STRATEGY=default` to select strategy
 
