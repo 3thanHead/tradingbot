@@ -67,11 +67,24 @@ type ExitConditions struct {
 }
 
 // Strategy defines complete trading strategy
+// Supports either unified entry/exit OR separate long/short configurations
 type Strategy struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Entry       EntryConditions `json:"entry"`
-	Exit        ExitConditions  `json:"exit"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+
+	// Option 1: Unified entry/exit (applies to both LONG and SHORT)
+	Entry *EntryConditions `json:"entry,omitempty"`
+	Exit  *ExitConditions  `json:"exit,omitempty"`
+
+	// Option 2: Separate LONG and SHORT configurations
+	Long  *PositionStrategy `json:"long,omitempty"`
+	Short *PositionStrategy `json:"short,omitempty"`
+}
+
+// PositionStrategy defines entry/exit for a specific position direction
+type PositionStrategy struct {
+	Entry EntryConditions `json:"entry"`
+	Exit  ExitConditions  `json:"exit"`
 }
 
 // Position state for each symbol
@@ -165,12 +178,88 @@ func loadStrategy(name string) (*Strategy, error) {
 		return nil, fmt.Errorf("invalid strategy: %v", err)
 	}
 
-	log.Printf("✅ [STRATEGY] Loaded: %s", strategy.Name)
-	log.Printf("📖 [STRATEGY] %s", strategy.Description)
-	log.Printf("📊 [STRATEGY] Entry: %d steps (%s combination)",
-		len(strategy.Entry.Steps), strategy.Entry.Combination)
-	log.Printf("📊 [STRATEGY] Exit: %d conditions (%s combination)",
-		len(strategy.Exit.Conditions), strategy.Exit.Combination)
+	// Print prominent strategy header
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("⭐ STRATEGY LOADED: %s", strings.ToUpper(strategy.Name))
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("📖 %s", strategy.Description)
+	log.Println("")
+
+	// Log based on strategy format
+	if strategy.Entry != nil && strategy.Exit != nil {
+		// Unified format
+		log.Printf("📊 Format: Unified (same logic for LONG and SHORT)")
+		log.Println("")
+
+		// Entry steps
+		log.Printf("� ENTRY (%s - %d steps):", strings.ToUpper(strategy.Entry.Combination), len(strategy.Entry.Steps))
+		for i, step := range strategy.Entry.Steps {
+			comment := step.Comment
+			if comment == "" {
+				comment = "No description"
+			}
+			log.Printf("   %d. %s → %s", i+1, step.Webhook, comment)
+		}
+		log.Println("")
+
+		// Exit conditions
+		log.Printf("🔴 EXIT (%s - %d conditions):", strings.ToUpper(strategy.Exit.Combination), len(strategy.Exit.Conditions))
+		for i, condition := range strategy.Exit.Conditions {
+			comment := condition.Comment
+			if comment == "" {
+				comment = "No description"
+			}
+			log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+		}
+
+	} else if strategy.Long != nil && strategy.Short != nil {
+		// Separate LONG/SHORT format
+		log.Printf("📊 Format: Separate LONG/SHORT configurations")
+		log.Println("")
+
+		// LONG entry/exit
+		log.Printf("🟢 LONG ENTRY (%s - %d steps):", strings.ToUpper(strategy.Long.Entry.Combination), len(strategy.Long.Entry.Steps))
+		for i, step := range strategy.Long.Entry.Steps {
+			comment := step.Comment
+			if comment == "" {
+				comment = "No description"
+			}
+			log.Printf("   %d. %s → %s", i+1, step.Webhook, comment)
+		}
+		log.Println("")
+
+		log.Printf("🔴 LONG EXIT (%s - %d conditions):", strings.ToUpper(strategy.Long.Exit.Combination), len(strategy.Long.Exit.Conditions))
+		for i, condition := range strategy.Long.Exit.Conditions {
+			comment := condition.Comment
+			if comment == "" {
+				comment = "No description"
+			}
+			log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+		}
+		log.Println("")
+
+		// SHORT entry/exit
+		log.Printf("🟠 SHORT ENTRY (%s - %d steps):", strings.ToUpper(strategy.Short.Entry.Combination), len(strategy.Short.Entry.Steps))
+		for i, step := range strategy.Short.Entry.Steps {
+			comment := step.Comment
+			if comment == "" {
+				comment = "No description"
+			}
+			log.Printf("   %d. %s → %s", i+1, step.Webhook, comment)
+		}
+		log.Println("")
+
+		log.Printf("🔴 SHORT EXIT (%s - %d conditions):", strings.ToUpper(strategy.Short.Exit.Combination), len(strategy.Short.Exit.Conditions))
+		for i, condition := range strategy.Short.Exit.Conditions {
+			comment := condition.Comment
+			if comment == "" {
+				comment = "No description"
+			}
+			log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+		}
+	}
+
+	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	return &strategy, nil
 }
@@ -181,39 +270,40 @@ func validateStrategy(s *Strategy) error {
 		return fmt.Errorf("strategy name is required")
 	}
 
-	// Validate entry conditions
-	if len(s.Entry.Steps) == 0 {
-		return fmt.Errorf("entry must have at least one step")
+	// Check which format is being used
+	hasUnified := s.Entry != nil && s.Exit != nil
+	hasSeparate := s.Long != nil && s.Short != nil
+
+	if !hasUnified && !hasSeparate {
+		return fmt.Errorf("strategy must have either unified entry/exit OR separate long/short configurations")
 	}
 
-	// Validate entry combination mode
-	validCombination := map[string]bool{"all": true, "all_sequential": true, "any": true}
-	if !validCombination[s.Entry.Combination] {
-		return fmt.Errorf("invalid entry combination: %s (must be 'all', 'all_sequential', or 'any')", s.Entry.Combination)
+	if hasUnified && hasSeparate {
+		return fmt.Errorf("strategy cannot have both unified and separate configurations - choose one")
 	}
 
-	// Validate each entry step has a webhook
-	for i, step := range s.Entry.Steps {
-		if step.Webhook == "" {
-			return fmt.Errorf("entry step %d is missing webhook path", i+1)
+	// Validate based on format
+	if hasUnified {
+		// Validate unified entry/exit
+		if err := validateEntryConditions(s.Entry); err != nil {
+			return fmt.Errorf("entry: %v", err)
 		}
-	}
-
-	// Validate exit conditions
-	if len(s.Exit.Conditions) == 0 {
-		return fmt.Errorf("exit must have at least one condition")
-	}
-
-	// Validate exit combination mode
-	validExitCombination := map[string]bool{"any": true, "all": true}
-	if !validExitCombination[s.Exit.Combination] {
-		return fmt.Errorf("invalid exit combination: %s (must be 'any' or 'all')", s.Exit.Combination)
-	}
-
-	// Validate each exit condition has a webhook
-	for i, condition := range s.Exit.Conditions {
-		if condition.Webhook == "" {
-			return fmt.Errorf("exit condition %d is missing webhook path", i+1)
+		if err := validateExitConditions(s.Exit); err != nil {
+			return fmt.Errorf("exit: %v", err)
+		}
+	} else {
+		// Validate separate LONG/SHORT
+		if err := validateEntryConditions(&s.Long.Entry); err != nil {
+			return fmt.Errorf("long entry: %v", err)
+		}
+		if err := validateExitConditions(&s.Long.Exit); err != nil {
+			return fmt.Errorf("long exit: %v", err)
+		}
+		if err := validateEntryConditions(&s.Short.Entry); err != nil {
+			return fmt.Errorf("short entry: %v", err)
+		}
+		if err := validateExitConditions(&s.Short.Exit); err != nil {
+			return fmt.Errorf("short exit: %v", err)
 		}
 	}
 
@@ -221,10 +311,65 @@ func validateStrategy(s *Strategy) error {
 	return nil
 }
 
+// Helper: validate entry conditions
+func validateEntryConditions(entry *EntryConditions) error {
+	if len(entry.Steps) == 0 {
+		return fmt.Errorf("must have at least one step")
+	}
+
+	validCombination := map[string]bool{"all": true, "all_sequential": true, "any": true}
+	if !validCombination[entry.Combination] {
+		return fmt.Errorf("invalid combination: %s (must be 'all', 'all_sequential', or 'any')", entry.Combination)
+	}
+
+	for i, step := range entry.Steps {
+		if step.Webhook == "" {
+			return fmt.Errorf("step %d is missing webhook path", i+1)
+		}
+	}
+
+	return nil
+}
+
+// Helper: validate exit conditions
+func validateExitConditions(exit *ExitConditions) error {
+	if len(exit.Conditions) == 0 {
+		return fmt.Errorf("must have at least one condition")
+	}
+
+	validCombination := map[string]bool{"any": true, "all": true}
+	if !validCombination[exit.Combination] {
+		return fmt.Errorf("invalid combination: %s (must be 'any' or 'all')", exit.Combination)
+	}
+
+	for i, condition := range exit.Conditions {
+		if condition.Webhook == "" {
+			return fmt.Errorf("condition %d is missing webhook path", i+1)
+		}
+	}
+
+	return nil
+}
+
 // Check if all entry conditions are met for opening a position
 func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 	state := getPositionState(symbol)
-	entryConditions := activeStrategy.Entry
+
+	// Get the appropriate entry conditions based on strategy format
+	var entryConditions *EntryConditions
+	if activeStrategy.Entry != nil {
+		// Unified format - same entry for both LONG and SHORT
+		entryConditions = activeStrategy.Entry
+	} else if isLong && activeStrategy.Long != nil {
+		// Separate format - use LONG entry
+		entryConditions = &activeStrategy.Long.Entry
+	} else if !isLong && activeStrategy.Short != nil {
+		// Separate format - use SHORT entry
+		entryConditions = &activeStrategy.Short.Entry
+	} else {
+		log.Printf("⚠️  [STRATEGY] No entry conditions found for %s position", map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+		return false
+	}
 
 	switch entryConditions.Combination {
 	case "all_sequential":
@@ -312,7 +457,21 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 
 // Check if any exit condition is met
 func shouldExitPosition(symbol string, isLong bool, r *http.Request) (bool, string) {
-	exitConditions := activeStrategy.Exit
+	// Get the appropriate exit conditions based on strategy format
+	var exitConditions *ExitConditions
+	if activeStrategy.Exit != nil {
+		// Unified format - same exit for both LONG and SHORT
+		exitConditions = activeStrategy.Exit
+	} else if isLong && activeStrategy.Long != nil {
+		// Separate format - use LONG exit
+		exitConditions = &activeStrategy.Long.Exit
+	} else if !isLong && activeStrategy.Short != nil {
+		// Separate format - use SHORT exit
+		exitConditions = &activeStrategy.Short.Exit
+	} else {
+		log.Printf("⚠️  [STRATEGY] No exit conditions found for %s position", map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+		return false, ""
+	}
 
 	// Check each exit condition
 	// Note: Position direction (isLong) comes from OANDA, not the strategy JSON
@@ -1419,36 +1578,40 @@ func main() {
 	}
 
 	log.Printf("✅ Server listening on port %s", port)
-	log.Println("\n📋 Webhook Endpoints:")
-	log.Println("   POST /webhook/rsi/crossed-up        (RSI > 70)")
-	log.Println("   POST /webhook/rsi/crossed-down      (RSI < 30)")
-	log.Println("   POST /webhook/rsi/crossed-center    (RSI crosses 50)")
-	log.Println("   POST /webhook/ma/ribbon-bullish     (MA ribbon bullish alignment)")
-	log.Println("   POST /webhook/ma/ribbon-bearish     (MA ribbon bearish alignment)")
-	log.Println("   POST /webhook/macd/cross-up         (MACD crosses up)")
-	log.Println("   POST /webhook/macd/cross-down       (MACD crosses down)")
-	log.Println("\n📊 Monitoring:")
-	log.Println("   GET /health")
-	log.Println("   GET /status")
 
 	// Fetch and display ngrok tunnel URL
 	log.Println("\n🌐 Fetching ngrok tunnel URL...")
 	time.Sleep(2 * time.Second) // Give ngrok time to start
 	ngrokURL := getNgrokURL()
+
 	if ngrokURL != "" {
 		log.Printf("✅ Public ngrok URL: %s", ngrokURL)
 		log.Println("\n📱 TradingView Webhook URLs:")
-		log.Printf("   • RSI Crossed Up:      %s/webhook/rsi/crossed-up", ngrokURL)
-		log.Printf("   • RSI Crossed Down:    %s/webhook/rsi/crossed-down", ngrokURL)
-		log.Printf("   • RSI Crossed Center:  %s/webhook/rsi/crossed-center", ngrokURL)
-		log.Printf("   • MA Ribbon Bullish:   %s/webhook/ma/ribbon-bullish", ngrokURL)
-		log.Printf("   • MA Ribbon Bearish:   %s/webhook/ma/ribbon-bearish", ngrokURL)
-		log.Printf("   • MACD Cross Up:       %s/webhook/macd/cross-up", ngrokURL)
-		log.Printf("   • MACD Cross Down:     %s/webhook/macd/cross-down", ngrokURL)
+		log.Printf("   POST %s/webhook/rsi/crossed-up        (RSI > 70)", ngrokURL)
+		log.Printf("   POST %s/webhook/rsi/crossed-down      (RSI < 30)", ngrokURL)
+		log.Printf("   POST %s/webhook/rsi/crossed-center    (RSI crosses 50)", ngrokURL)
+		log.Printf("   POST %s/webhook/ma/ribbon-bullish     (MA ribbon bullish)", ngrokURL)
+		log.Printf("   POST %s/webhook/ma/ribbon-bearish     (MA ribbon bearish)", ngrokURL)
+		log.Printf("   POST %s/webhook/macd/cross-up         (MACD crosses up)", ngrokURL)
+		log.Printf("   POST %s/webhook/macd/cross-down       (MACD crosses down)", ngrokURL)
+		log.Println("\n📊 Monitoring:")
+		log.Printf("   GET %s/health", ngrokURL)
+		log.Printf("   GET %s/status", ngrokURL)
 		log.Println("\n🖥️  ngrok Web Interface: http://localhost:4040")
 	} else {
 		log.Println("⚠️  Could not fetch ngrok URL (ngrok may not be running)")
 		log.Println("   Run 'docker-compose up' to start ngrok automatically")
+		log.Println("\n� Local Webhook Endpoints:")
+		log.Println("   POST /webhook/rsi/crossed-up        (RSI > 70)")
+		log.Println("   POST /webhook/rsi/crossed-down      (RSI < 30)")
+		log.Println("   POST /webhook/rsi/crossed-center    (RSI crosses 50)")
+		log.Println("   POST /webhook/ma/ribbon-bullish     (MA ribbon bullish)")
+		log.Println("   POST /webhook/ma/ribbon-bearish     (MA ribbon bearish)")
+		log.Println("   POST /webhook/macd/cross-up         (MACD crosses up)")
+		log.Println("   POST /webhook/macd/cross-down       (MACD crosses down)")
+		log.Println("\n� Monitoring:")
+		log.Println("   GET /health")
+		log.Println("   GET /status")
 	}
 	log.Println("")
 

@@ -6,9 +6,10 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
 
 1. **Choose a strategy**:
    ```bash
-   STRATEGY=default docker-compose up    # Original bot behavior
-   STRATEGY=ma_ribbon docker-compose up  # Trend following
-   STRATEGY=scalping docker-compose up   # Fast trading
+   STRATEGY=momentum docker-compose up       # ⭐ RECOMMENDED - Best simple strategy
+   STRATEGY=default docker-compose up        # MACD + RSI extremes
+   STRATEGY=ma_ribbon docker-compose up      # Trend following
+   STRATEGY=scalping docker-compose up       # Fast trading
    ```
 
 2. **Create custom strategy**:
@@ -20,23 +21,63 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
 
 ## Strategy Structure
 
+**Option 1: Unified (same entry/exit for LONG and SHORT)**
+
 ```json
 {
   "name": "my_strategy",
   "description": "What this strategy does",
   "entry": {
-    "combination": "all_sequential",  // or "all" or "any"
+    "combination": "all_sequential",
     "steps": [
       {"webhook": "/webhook/rsi/crossed-down", "comment": "Wait for oversold"},
       {"webhook": "/webhook/macd/cross-up", "comment": "Confirm with MACD"}
     ]
   },
   "exit": {
-    "combination": "any",  // Usually "any" for quick exits
+    "combination": "any",
     "conditions": [
-      {"webhook": "/webhook/rsi/crossed-up", "comment": "Exit if overbought"},
-      {"webhook": "/webhook/macd/cross-down", "comment": "Exit if reversal"}
+      {"webhook": "/webhook/rsi/crossed-up", "comment": "Exit if overbought"}
     ]
+  }
+}
+```
+
+**Option 2: Separate LONG and SHORT configurations**
+
+```json
+{
+  "name": "my_strategy",
+  "description": "Different logic for LONG vs SHORT",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "steps": [
+        {"webhook": "/webhook/macd/cross-up", "comment": "MACD bullish"},
+        {"webhook": "/webhook/rsi/crossed-down", "comment": "RSI oversold"}
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {"webhook": "/webhook/rsi/crossed-up", "comment": "RSI >70"}
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "steps": [
+        {"webhook": "/webhook/macd/cross-down", "comment": "MACD bearish"},
+        {"webhook": "/webhook/rsi/crossed-up", "comment": "RSI overbought"}
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {"webhook": "/webhook/rsi/crossed-down", "comment": "RSI <30"}
+      ]
+    }
   }
 }
 ```
@@ -69,10 +110,30 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
 
 ## Built-in Strategies
 
+### momentum.json ⭐ RECOMMENDED
+**Best simple strategy** - Momentum trading with RSI confirmation
+- **LONG Entry**: MACD cross up + RSI crosses 50 (upward momentum)
+- **LONG Exit**: MACD reversal OR RSI >70
+- **SHORT Entry**: MACD cross down + RSI crosses 50 (downward momentum)
+- **SHORT Exit**: MACD reversal OR RSI <30
+
+**Why it works:**
+- Enters when momentum shifts (MACD) AND RSI confirms direction (crosses 50)
+- Exits early on momentum reversal (MACD opposite cross)
+- Also exits at extremes for profit-taking (RSI >70 or <30)
+- Simple, clean logic that catches trends early
+
 ### default.json
-Original bot behavior - RSI extremes + MACD confirmation
-- **Entry**: Sequential (RSI < 30 → MACD cross up)
-- **Exit**: Any of 5 conditions
+MACD momentum + RSI confirmation (unified format)
+- **Entry**: All (RSI oversold + MACD cross up)
+- **Exit**: RSI opposite extreme
+
+### default-separate.json
+Separate LONG/SHORT logic (separate format)
+- **LONG Entry**: MACD cross up + RSI oversold
+- **LONG Exit**: RSI overbought (>70)
+- **SHORT Entry**: MACD cross down + RSI overbought
+- **SHORT Exit**: RSI oversold (<30)
 
 ### ma_ribbon.json
 Trend following - enter on strong trends

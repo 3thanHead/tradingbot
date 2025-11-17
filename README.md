@@ -21,10 +21,16 @@ docker-compose up --build
 Edit JSON files to change trading logic without coding:
 
 ```bash
-STRATEGY=default docker-compose up    # Original bot behavior  
-STRATEGY=ma_ribbon docker-compose up  # Trend following
-STRATEGY=scalping docker-compose up   # Fast trading
+STRATEGY=momentum docker-compose up       # ⭐ RECOMMENDED - Best simple strategy
+STRATEGY=default docker-compose up        # MACD + RSI extremes
+STRATEGY=ma_ribbon docker-compose up      # Trend following
+STRATEGY=scalping docker-compose up       # Fast trading
 ```
+
+**Momentum Strategy** (recommended):
+- Entry: MACD crossover + RSI crosses 50 (momentum confirmation)
+- Exit: MACD reversal OR RSI extremes (smart profit-taking)
+- See **[docs/MOMENTUM_STRATEGY.md](docs/MOMENTUM_STRATEGY.md)** for details
 
 See **[strategies/README.md](strategies/README.md)** for creating custom strategies.
 

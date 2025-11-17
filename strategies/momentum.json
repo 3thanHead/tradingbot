@@ -1,0 +1,60 @@
+{
+  "name": "momentum",
+  "description": "Simple momentum strategy - MACD trend + RSI confirmation, exits on reversal or extreme",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "steps": [
+        {
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD bullish crossover (momentum shift)"
+        },
+        {
+          "webhook": "/webhook/rsi/crossed-center",
+          "comment": "RSI crosses 50 (confirms upward momentum)"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD bearish crossover (momentum lost)"
+        },
+        {
+          "webhook": "/webhook/rsi/crossed-up",
+          "comment": "RSI overbought >70 (take profit zone)"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "steps": [
+        {
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD bearish crossover (momentum shift)"
+        },
+        {
+          "webhook": "/webhook/rsi/crossed-center",
+          "comment": "RSI crosses 50 (confirms downward momentum)"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD bullish crossover (momentum lost)"
+        },
+        {
+          "webhook": "/webhook/rsi/crossed-down",
+          "comment": "RSI oversold <30 (take profit zone)"
+        }
+      ]
+    }
+  }
+}
