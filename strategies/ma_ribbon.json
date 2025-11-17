@@ -3,7 +3,7 @@
   "description": "MA ribbon trend-following - enter when all MAs align, exit on ribbon reversal",
   "entry": {
     "combination": "all",
-    "steps": [
+    "conditions": [
       {
         "webhook": "/webhook/ma/ribbon-bullish",
         "comment": "All MAs aligned bullish (5>10>20>50>100)"

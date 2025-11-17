@@ -3,7 +3,7 @@
   "description": "Fast scalping - quick entries on MACD + RSI neutral, tight exits",
   "entry": {
     "combination": "all",
-    "steps": [
+    "conditions": [
       {
         "webhook": "/webhook/macd/cross-up",
         "comment": "MACD crosses up (bullish signal)"

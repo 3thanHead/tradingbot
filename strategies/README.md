@@ -28,8 +28,8 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
   "name": "my_strategy",
   "description": "What this strategy does",
   "entry": {
-    "combination": "all_sequential",
-    "steps": [
+    "combination": "sequential",
+    "conditions": [
       {"webhook": "/webhook/rsi/crossed-down", "comment": "Wait for oversold"},
       {"webhook": "/webhook/macd/cross-up", "comment": "Confirm with MACD"}
     ]
@@ -52,7 +52,7 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
   "long": {
     "entry": {
       "combination": "all",
-      "steps": [
+      "conditions": [
         {"webhook": "/webhook/macd/cross-up", "comment": "MACD bullish"},
         {"webhook": "/webhook/rsi/crossed-down", "comment": "RSI oversold"}
       ]
@@ -67,7 +67,7 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
   "short": {
     "entry": {
       "combination": "all",
-      "steps": [
+      "conditions": [
         {"webhook": "/webhook/macd/cross-down", "comment": "MACD bearish"},
         {"webhook": "/webhook/rsi/crossed-up", "comment": "RSI overbought"}
       ]
@@ -99,14 +99,10 @@ JSON strategy files that define when to enter and exit trades. Edit these files 
 
 ## Combination Modes
 
-**Entry:**
-- `all_sequential` - Steps happen in exact order (wait for A, then B, then C)
-- `all` - All must happen (order doesn't matter)
-- `any` - Any single step triggers entry
-
-**Exit:**
-- `any` - First condition closes position (recommended)
-- `all` - All must trigger (rarely used)
+**All modes (Entry & Exit):**
+- `sequential` - Conditions fire in exact order (A → then B → then C)
+- `all` - All must fire (order doesn't matter)
+- `any` - Any single condition triggers action
 
 ## Built-in Strategies
 

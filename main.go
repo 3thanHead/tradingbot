@@ -32,38 +32,28 @@ type TradingViewEvent struct {
 // STRATEGY SYSTEM TYPES
 // ============================================================================
 //
-// NAMING CONVENTION:
-// - Entry uses "steps" (can be sequential: step 1 → step 2 → step 3)
-// - Exit uses "conditions" (usually independent triggers)
-// Both are essentially webhook triggers, just named differently for clarity.
+// COMBINATION MODES:
+// - "any": Any single condition triggers the action
+// - "all": All conditions must be met (order doesn't matter)
+// - "sequential": All conditions must be met IN SEQUENTIAL ORDER (1 → 2 → 3)
 // ============================================================================
 
-// EntryStep represents a single webhook trigger for entering a position
-// Called "step" because entries can be sequential (wait for step 1, then step 2, etc.)
-type EntryStep struct {
+// Condition represents a single webhook trigger
+type Condition struct {
 	Webhook string `json:"webhook"` // Webhook URL path, e.g., "/webhook/rsi/crossed-down"
 	Comment string `json:"comment"` // Optional human-readable description
 }
 
-// EntryConditions defines how entry steps combine to trigger a trade
+// EntryConditions defines how entry conditions combine to trigger a trade
 type EntryConditions struct {
-	Combination string      `json:"combination"` // How to combine: "all", "all_sequential", or "any"
-	Steps       []EntryStep `json:"steps"`       // Array of webhook triggers for entry
-}
-
-// ExitCondition represents a single webhook trigger for exiting a position
-// Called "condition" because exits are usually independent triggers (any can close)
-// ExitCondition defines a webhook that can trigger position exit
-// Position direction (LONG/SHORT) is determined from the actual OANDA position
-type ExitCondition struct {
-	Webhook string `json:"webhook"` // Webhook URL path, e.g., "/webhook/macd/cross-down"
-	Comment string `json:"comment"` // Optional human-readable description
+	Combination string      `json:"combination"` // "any", "all", or "sequential"
+	Conditions  []Condition `json:"conditions"`  // Array of webhook triggers for entry
 }
 
 // ExitConditions defines how exit conditions combine to close a position
 type ExitConditions struct {
-	Combination string          `json:"combination"` // How to combine: "any" (typical) or "all" (rare)
-	Conditions  []ExitCondition `json:"conditions"`  // Array of webhook triggers for exit
+	Combination string      `json:"combination"` // "any", "all", or "sequential"
+	Conditions  []Condition `json:"conditions"`  // Array of webhook triggers for exit
 }
 
 // Strategy defines complete trading strategy
@@ -101,8 +91,11 @@ type PositionState struct {
 	SwingLow         float64 // Latest swing low price level
 	RSICrossedCenter bool    // Tracks if RSI crossed center (first warning)
 
-	// Track which entry steps have been completed
-	EntryStepsCompleted map[string]bool // Maps step index to completion status
+	// Track which entry conditions have been completed
+	EntryConditionsCompleted map[string]bool // Maps condition index to completion status
+
+	// Track which exit conditions have been completed
+	ExitConditionsCompleted map[string]bool // Maps condition index to completion status
 
 	// Track MA ribbon state
 	MARibbonBullish bool // Fast > Mid > Slow
@@ -136,10 +129,11 @@ func getPositionState(symbol string) *PositionState {
 
 	if _, exists := positions[symbol]; !exists {
 		positions[symbol] = &PositionState{
-			Symbol:              symbol,
-			PositionOpen:        false,
-			Position:            "none",
-			EntryStepsCompleted: make(map[string]bool),
+			Symbol:                   symbol,
+			PositionOpen:             false,
+			Position:                 "none",
+			EntryConditionsCompleted: make(map[string]bool),
+			ExitConditionsCompleted:  make(map[string]bool),
 		}
 	}
 	return positions[symbol]
@@ -191,25 +185,44 @@ func loadStrategy(name string) (*Strategy, error) {
 		log.Printf("📊 Format: Unified (same logic for LONG and SHORT)")
 		log.Println("")
 
-		// Entry steps
-		log.Printf("� ENTRY (%s - %d steps):", strings.ToUpper(strategy.Entry.Combination), len(strategy.Entry.Steps))
-		for i, step := range strategy.Entry.Steps {
-			comment := step.Comment
-			if comment == "" {
-				comment = "No description"
-			}
-			log.Printf("   %d. %s → %s", i+1, step.Webhook, comment)
+		// Entry conditions
+		if strategy.Entry.Combination == "sequential" {
+			log.Printf("🟢 ENTRY (%s - %d conditions IN ORDER):", strings.ToUpper(strategy.Entry.Combination), len(strategy.Entry.Conditions))
+		} else {
+			log.Printf("🟢 ENTRY (%s - %d conditions):", strings.ToUpper(strategy.Entry.Combination), len(strategy.Entry.Conditions))
 		}
-		log.Println("")
-
-		// Exit conditions
-		log.Printf("🔴 EXIT (%s - %d conditions):", strings.ToUpper(strategy.Exit.Combination), len(strategy.Exit.Conditions))
-		for i, condition := range strategy.Exit.Conditions {
+		for i, condition := range strategy.Entry.Conditions {
 			comment := condition.Comment
 			if comment == "" {
 				comment = "No description"
 			}
 			log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+		}
+		log.Println("")
+
+		// Exit conditions
+		if len(strategy.Exit.Conditions) > 0 {
+			if strategy.Exit.Combination == "sequential" {
+				log.Printf("🔴 EXIT (%s - %d conditions IN ORDER):", strings.ToUpper(strategy.Exit.Combination), len(strategy.Exit.Conditions))
+			} else {
+				log.Printf("🔴 EXIT (%s - %d conditions):", strings.ToUpper(strategy.Exit.Combination), len(strategy.Exit.Conditions))
+			}
+			for i, condition := range strategy.Exit.Conditions {
+				comment := condition.Comment
+				if comment == "" {
+					comment = "No description"
+				}
+				log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+			}
+		} else {
+			log.Printf("🔴 EXIT (%s - %d conditions):", strings.ToUpper(strategy.Exit.Combination), len(strategy.Exit.Conditions))
+			for i, condition := range strategy.Exit.Conditions {
+				comment := condition.Comment
+				if comment == "" {
+					comment = "No description"
+				}
+				log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+			}
 		}
 
 	} else if strategy.Long != nil && strategy.Short != nil {
@@ -218,44 +231,108 @@ func loadStrategy(name string) (*Strategy, error) {
 		log.Println("")
 
 		// LONG entry/exit
-		log.Printf("🟢 LONG ENTRY (%s - %d steps):", strings.ToUpper(strategy.Long.Entry.Combination), len(strategy.Long.Entry.Steps))
-		for i, step := range strategy.Long.Entry.Steps {
-			comment := step.Comment
-			if comment == "" {
-				comment = "No description"
-			}
-			log.Printf("   %d. %s → %s", i+1, step.Webhook, comment)
+		if strategy.Long.Entry.Combination == "sequential" {
+			log.Printf("🟢 LONG ENTRY (%s - %d conditions IN ORDER):", strings.ToUpper(strategy.Long.Entry.Combination), len(strategy.Long.Entry.Conditions))
+		} else {
+			log.Printf("🟢 LONG ENTRY (%s - %d conditions):", strings.ToUpper(strategy.Long.Entry.Combination), len(strategy.Long.Entry.Conditions))
 		}
-		log.Println("")
-
-		log.Printf("🔴 LONG EXIT (%s - %d conditions):", strings.ToUpper(strategy.Long.Exit.Combination), len(strategy.Long.Exit.Conditions))
-		for i, condition := range strategy.Long.Exit.Conditions {
+		for i, condition := range strategy.Long.Entry.Conditions {
 			comment := condition.Comment
 			if comment == "" {
 				comment = "No description"
 			}
 			log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+		}
+		log.Println("")
+
+		log.Printf("🔴 LONG EXIT (%s - %d %s%s):", strings.ToUpper(strategy.Long.Exit.Combination),
+			func() int {
+				if len(strategy.Long.Exit.Conditions) > 0 {
+					return len(strategy.Long.Exit.Conditions)
+				}
+				return len(strategy.Long.Exit.Conditions)
+			}(),
+			func() string {
+				if len(strategy.Long.Exit.Conditions) > 0 {
+					return "steps"
+				}
+				return "conditions"
+			}(),
+			func() string {
+				if len(strategy.Long.Exit.Conditions) > 0 && strategy.Long.Exit.Combination == "sequential" {
+					return " IN ORDER"
+				}
+				return ""
+			}())
+		if len(strategy.Long.Exit.Conditions) > 0 {
+			for i, condition := range strategy.Long.Exit.Conditions {
+				comment := condition.Comment
+				if comment == "" {
+					comment = "No description"
+				}
+				log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+			}
+		} else {
+			for i, condition := range strategy.Long.Exit.Conditions {
+				comment := condition.Comment
+				if comment == "" {
+					comment = "No description"
+				}
+				log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+			}
 		}
 		log.Println("")
 
 		// SHORT entry/exit
-		log.Printf("🟠 SHORT ENTRY (%s - %d steps):", strings.ToUpper(strategy.Short.Entry.Combination), len(strategy.Short.Entry.Steps))
-		for i, step := range strategy.Short.Entry.Steps {
-			comment := step.Comment
-			if comment == "" {
-				comment = "No description"
-			}
-			log.Printf("   %d. %s → %s", i+1, step.Webhook, comment)
+		if strategy.Short.Entry.Combination == "sequential" {
+			log.Printf("🟠 SHORT ENTRY (%s - %d conditions IN ORDER):", strings.ToUpper(strategy.Short.Entry.Combination), len(strategy.Short.Entry.Conditions))
+		} else {
+			log.Printf("🟠 SHORT ENTRY (%s - %d conditions):", strings.ToUpper(strategy.Short.Entry.Combination), len(strategy.Short.Entry.Conditions))
 		}
-		log.Println("")
-
-		log.Printf("🔴 SHORT EXIT (%s - %d conditions):", strings.ToUpper(strategy.Short.Exit.Combination), len(strategy.Short.Exit.Conditions))
-		for i, condition := range strategy.Short.Exit.Conditions {
+		for i, condition := range strategy.Short.Entry.Conditions {
 			comment := condition.Comment
 			if comment == "" {
 				comment = "No description"
 			}
 			log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+		}
+		log.Println("")
+
+		log.Printf("🔴 SHORT EXIT (%s - %d %s%s):", strings.ToUpper(strategy.Short.Exit.Combination),
+			func() int {
+				if len(strategy.Short.Exit.Conditions) > 0 {
+					return len(strategy.Short.Exit.Conditions)
+				}
+				return len(strategy.Short.Exit.Conditions)
+			}(),
+			func() string {
+				if len(strategy.Short.Exit.Conditions) > 0 {
+					return "steps"
+				}
+				return "conditions"
+			}(),
+			func() string {
+				if len(strategy.Short.Exit.Conditions) > 0 && strategy.Short.Exit.Combination == "sequential" {
+					return " IN ORDER"
+				}
+				return ""
+			}())
+		if len(strategy.Short.Exit.Conditions) > 0 {
+			for i, condition := range strategy.Short.Exit.Conditions {
+				comment := condition.Comment
+				if comment == "" {
+					comment = "No description"
+				}
+				log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+			}
+		} else {
+			for i, condition := range strategy.Short.Exit.Conditions {
+				comment := condition.Comment
+				if comment == "" {
+					comment = "No description"
+				}
+				log.Printf("   %d. %s → %s", i+1, condition.Webhook, comment)
+			}
 		}
 	}
 
@@ -313,18 +390,18 @@ func validateStrategy(s *Strategy) error {
 
 // Helper: validate entry conditions
 func validateEntryConditions(entry *EntryConditions) error {
-	if len(entry.Steps) == 0 {
-		return fmt.Errorf("must have at least one step")
+	if len(entry.Conditions) == 0 {
+		return fmt.Errorf("must have at least one condition")
 	}
 
-	validCombination := map[string]bool{"all": true, "all_sequential": true, "any": true}
+	validCombination := map[string]bool{"all": true, "sequential": true, "any": true}
 	if !validCombination[entry.Combination] {
-		return fmt.Errorf("invalid combination: %s (must be 'all', 'all_sequential', or 'any')", entry.Combination)
+		return fmt.Errorf("invalid combination: %s (must be 'all', 'sequential', or 'any')", entry.Combination)
 	}
 
-	for i, step := range entry.Steps {
-		if step.Webhook == "" {
-			return fmt.Errorf("step %d is missing webhook path", i+1)
+	for i, condition := range entry.Conditions {
+		if condition.Webhook == "" {
+			return fmt.Errorf("condition %d is missing webhook path", i+1)
 		}
 	}
 
@@ -337,9 +414,9 @@ func validateExitConditions(exit *ExitConditions) error {
 		return fmt.Errorf("must have at least one condition")
 	}
 
-	validCombination := map[string]bool{"any": true, "all": true}
+	validCombination := map[string]bool{"any": true, "all": true, "sequential": true}
 	if !validCombination[exit.Combination] {
-		return fmt.Errorf("invalid combination: %s (must be 'any' or 'all')", exit.Combination)
+		return fmt.Errorf("invalid combination: %s (must be 'any', 'all', or 'sequential')", exit.Combination)
 	}
 
 	for i, condition := range exit.Conditions {
@@ -372,70 +449,95 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 	}
 
 	switch entryConditions.Combination {
-	case "all_sequential":
-		// Sequential: steps must be completed in exact order
-		for i, step := range entryConditions.Steps {
-			stepKey := fmt.Sprintf("step_%d", i)
+	case "sequential":
+		// Sequential: conditions must be completed IN EXACT ORDER
+		currentPath := r.URL.Path
 
-			// If this webhook matches the current step
-			if step.Webhook == r.URL.Path {
-				// Mark step completed
-				mu.Lock()
-				state.EntryStepsCompleted[stepKey] = true
-				mu.Unlock()
+		// Find the next expected condition (first incomplete condition)
+		nextConditionIndex := -1
+		for i := 0; i < len(entryConditions.Conditions); i++ {
+			key := fmt.Sprintf("condition_%d", i)
+			if !state.EntryConditionsCompleted[key] {
+				nextConditionIndex = i
+				break
+			}
+		}
 
-				log.Printf("✅ [STRATEGY] Entry step %d/%d completed: %s",
-					i+1, len(entryConditions.Steps), step.Comment)
+		// If all conditions already completed, shouldn't happen but handle gracefully
+		if nextConditionIndex == -1 {
+			log.Printf("⚠️  [STRATEGY] All entry conditions already completed")
+			return false
+		}
 
-				// Check if ALL steps are now completed
-				allComplete := true
-				for j := 0; j < len(entryConditions.Steps); j++ {
-					key := fmt.Sprintf("step_%d", j)
-					if !state.EntryStepsCompleted[key] {
-						allComplete = false
-						break
-					}
-				}
+		nextCondition := entryConditions.Conditions[nextConditionIndex]
 
-				if allComplete {
-					log.Printf("🎯 [STRATEGY] All entry conditions met!")
-					// Reset steps for next trade
-					mu.Lock()
-					state.EntryStepsCompleted = make(map[string]bool)
-					mu.Unlock()
-					return true
+		// Check if the current webhook matches the NEXT expected condition
+		if nextCondition.Webhook == currentPath {
+			conditionKey := fmt.Sprintf("condition_%d", nextConditionIndex)
+			mu.Lock()
+			state.EntryConditionsCompleted[conditionKey] = true
+			mu.Unlock()
+
+			log.Printf("✅ [STRATEGY] Entry condition %d/%d completed IN ORDER: %s",
+				nextConditionIndex+1, len(entryConditions.Conditions), nextCondition.Comment)
+
+			// Check if ALL conditions are now completed
+			allComplete := true
+			for i := 0; i < len(entryConditions.Conditions); i++ {
+				key := fmt.Sprintf("condition_%d", i)
+				if !state.EntryConditionsCompleted[key] {
+					allComplete = false
+					log.Printf("⏳ [STRATEGY] Waiting for condition %d/%d: %s",
+						i+1, len(entryConditions.Conditions), entryConditions.Conditions[i].Comment)
+					break
 				}
 			}
+
+			if allComplete {
+				log.Printf("🎯 [STRATEGY] All entry conditions completed IN ORDER!")
+				// Reset conditions for next trade
+				mu.Lock()
+				state.EntryConditionsCompleted = make(map[string]bool)
+				mu.Unlock()
+				return true
+			}
+		} else {
+			// Webhook fired but it's not the next expected condition
+			log.Printf("⚠️  [STRATEGY] Received %s but expecting condition %d/%d: %s (conditions must be completed IN ORDER)",
+				currentPath, nextConditionIndex+1, len(entryConditions.Conditions), nextCondition.Webhook)
 		}
 		return false
 
 	case "all":
 		// All conditions must be met (order doesn't matter)
-		// Mark this step as completed
-		for i, step := range entryConditions.Steps {
-			if step.Webhook == r.URL.Path {
-				stepKey := fmt.Sprintf("step_%d", i)
+		currentPath := r.URL.Path
+
+		// Mark this condition as completed if it matches
+		for i, condition := range entryConditions.Conditions {
+			if condition.Webhook == currentPath {
+				conditionKey := fmt.Sprintf("condition_%d", i)
 				mu.Lock()
-				state.EntryStepsCompleted[stepKey] = true
+				state.EntryConditionsCompleted[conditionKey] = true
 				mu.Unlock()
-				log.Printf("✅ [STRATEGY] Entry condition met: %s", step.Comment)
+				log.Printf("✅ [STRATEGY] Entry condition met: %s", condition.Comment)
 			}
 		}
 
 		// Check if all are completed
 		allComplete := true
-		for i := 0; i < len(entryConditions.Steps); i++ {
-			key := fmt.Sprintf("step_%d", i)
-			if !state.EntryStepsCompleted[key] {
+		for i := 0; i < len(entryConditions.Conditions); i++ {
+			key := fmt.Sprintf("condition_%d", i)
+			if !state.EntryConditionsCompleted[key] {
 				allComplete = false
 				break
 			}
 		}
 
 		if allComplete {
-			log.Printf("🎯 [STRATEGY] All simultaneous entry conditions met!")
+			log.Printf("🎯 [STRATEGY] All entry conditions met!")
+			// Reset conditions for next trade
 			mu.Lock()
-			state.EntryStepsCompleted = make(map[string]bool)
+			state.EntryConditionsCompleted = make(map[string]bool)
 			mu.Unlock()
 			return true
 		}
@@ -443,9 +545,9 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 
 	case "any":
 		// Any condition triggers entry
-		for _, step := range entryConditions.Steps {
-			if step.Webhook == r.URL.Path {
-				log.Printf("🎯 [STRATEGY] Entry condition met: %s", step.Comment)
+		for _, condition := range entryConditions.Conditions {
+			if condition.Webhook == r.URL.Path {
+				log.Printf("🎯 [STRATEGY] Entry condition met: %s", condition.Comment)
 				return true
 			}
 		}
@@ -457,6 +559,8 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 
 // Check if any exit condition is met
 func shouldExitPosition(symbol string, isLong bool, r *http.Request) (bool, string) {
+	state := getPositionState(symbol)
+
 	// Get the appropriate exit conditions based on strategy format
 	var exitConditions *ExitConditions
 	if activeStrategy.Exit != nil {
@@ -473,17 +577,115 @@ func shouldExitPosition(symbol string, isLong bool, r *http.Request) (bool, stri
 		return false, ""
 	}
 
-	// Check each exit condition
-	// Note: Position direction (isLong) comes from OANDA, not the strategy JSON
-	for _, condition := range exitConditions.Conditions {
-		// Check if this webhook matches the exit condition
-		if condition.Webhook == r.URL.Path {
-			reason := condition.Comment
-			if reason == "" {
-				reason = fmt.Sprintf("exit condition: %s", r.URL.Path)
+	// Check exit based on combination mode
+	currentPath := r.URL.Path
+
+	switch exitConditions.Combination {
+	case "sequential":
+		// Sequential: conditions must be completed IN EXACT ORDER
+		// Find the next expected condition (first incomplete condition)
+		nextConditionIndex := -1
+		for i := 0; i < len(exitConditions.Conditions); i++ {
+			key := fmt.Sprintf("condition_%d", i)
+			if !state.ExitConditionsCompleted[key] {
+				nextConditionIndex = i
+				break
 			}
+		}
+
+		// If all conditions already completed, shouldn't happen but handle gracefully
+		if nextConditionIndex == -1 {
+			log.Printf("⚠️  [EXIT] All exit conditions already completed")
+			return false, ""
+		}
+
+		nextCondition := exitConditions.Conditions[nextConditionIndex]
+
+		// Check if the current webhook matches the NEXT expected condition
+		if nextCondition.Webhook == currentPath {
+			conditionKey := fmt.Sprintf("condition_%d", nextConditionIndex)
+			mu.Lock()
+			state.ExitConditionsCompleted[conditionKey] = true
+			mu.Unlock()
+
+			log.Printf("✅ [EXIT] Exit condition %d/%d completed IN ORDER: %s",
+				nextConditionIndex+1, len(exitConditions.Conditions), nextCondition.Comment)
+
+			// Check if ALL conditions are now completed
+			allCompleted := true
+			for i := 0; i < len(exitConditions.Conditions); i++ {
+				key := fmt.Sprintf("condition_%d", i)
+				if !state.ExitConditionsCompleted[key] {
+					allCompleted = false
+					log.Printf("⏳ [EXIT] Waiting for condition %d/%d: %s",
+						i+1, len(exitConditions.Conditions), exitConditions.Conditions[i].Comment)
+					break
+				}
+			}
+
+			if allCompleted {
+				reason := "All exit conditions completed IN ORDER"
+				log.Printf("🎯 [EXIT] %s", reason)
+				// Reset exit conditions for next position
+				mu.Lock()
+				state.ExitConditionsCompleted = make(map[string]bool)
+				mu.Unlock()
+				return true, reason
+			}
+		} else {
+			// Webhook fired but it's not the next expected condition
+			log.Printf("⚠️  [EXIT] Received %s but expecting condition %d/%d: %s (conditions must be completed IN ORDER)",
+				currentPath, nextConditionIndex+1, len(exitConditions.Conditions), nextCondition.Webhook)
+		}
+		return false, ""
+
+	case "all":
+		// All conditions must be met (order doesn't matter)
+		// Mark this condition as completed if it matches
+		for i, condition := range exitConditions.Conditions {
+			if condition.Webhook == currentPath {
+				conditionKey := fmt.Sprintf("condition_%d", i)
+				mu.Lock()
+				state.ExitConditionsCompleted[conditionKey] = true
+				mu.Unlock()
+				log.Printf("✅ [EXIT] Exit condition met: %s", condition.Comment)
+			}
+		}
+
+		// Check if all are completed
+		allCompleted := true
+		for i := 0; i < len(exitConditions.Conditions); i++ {
+			key := fmt.Sprintf("condition_%d", i)
+			if !state.ExitConditionsCompleted[key] {
+				allCompleted = false
+				break
+			}
+		}
+
+		if allCompleted {
+			reason := "All exit conditions met"
+			log.Printf("🎯 [EXIT] %s", reason)
+			// Reset exit conditions for next position
+			mu.Lock()
+			state.ExitConditionsCompleted = make(map[string]bool)
+			mu.Unlock()
 			return true, reason
 		}
+		return false, ""
+
+	case "any":
+		// Any single condition triggers exit
+		for _, condition := range exitConditions.Conditions {
+			if condition.Webhook == currentPath {
+				reason := condition.Comment
+				if reason == "" {
+					reason = fmt.Sprintf("exit condition: %s", currentPath)
+				}
+				log.Printf("🎯 [EXIT] %s", reason)
+				return true, reason
+			}
+		}
+		return false, ""
 	}
 
 	return false, ""
@@ -1274,6 +1476,7 @@ func openLongPosition(symbol string, price string) {
 	state.PositionOpen = true
 	state.Position = "long"
 	state.TradeID = tradeID
+	state.ExitConditionsCompleted = make(map[string]bool) // Reset exit conditions when opening position
 	mu.Unlock()
 
 	log.Printf("✅ LONG position opened: %s (ID: %s)", symbol, tradeID)
@@ -1304,6 +1507,7 @@ func openShortPosition(symbol string, price string) {
 	state.PositionOpen = true
 	state.Position = "short"
 	state.TradeID = tradeID
+	state.ExitConditionsCompleted = make(map[string]bool) // Reset exit conditions when opening position
 	mu.Unlock()
 
 	log.Printf("✅ SHORT position opened: %s (ID: %s)", symbol, tradeID)
