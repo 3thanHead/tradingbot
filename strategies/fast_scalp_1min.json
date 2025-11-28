@@ -1,0 +1,78 @@
+{
+  "name": "Fast EMA + MACD + RSI Scalping Strategy (1min)",
+  "description": "Long: Price above EMA200 + MACD signal line cross up + RSI(7) crosses above 60. Exit on MACD cross down, EMA9 break, or RSI overbought (75). Short: inverse with RSI oversold exit (25).",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ema/price-above-ema200",
+          "comment": "Price above EMA 200 - aligns with larger timeframe"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD signal line crosses up - bullish momentum"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-up-60",
+          "comment": "RSI(7) crosses above 60 - move already underway"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD signal line crosses down - momentum flip"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-down-overbuy-75",
+          "comment": "RSI(7) crosses down from 75 - overbought exit"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ema/price-below-ema200",
+          "comment": "Price below EMA 200 - aligns with larger timeframe"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD signal line crosses down - bearish momentum"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-down-40",
+          "comment": "RSI(7) crosses below 40 - move already underway"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD signal line crosses up - momentum flip"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-up-oversell-25",
+          "comment": "RSI(7) crosses up from 25 - oversold exit"
+        }
+      ]
+    }
+  }
+}

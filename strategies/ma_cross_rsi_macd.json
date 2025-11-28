@@ -17,11 +17,6 @@
         },
         {
           "type": "condition",
-          "webhook": "/webhook/macd/cross-up",
-          "comment": "MACD signal line crosses up - momentum confirmation"
-        },
-        {
-          "type": "condition",
           "webhook": "/webhook/rsi/cross-up-50",
           "comment": "RSI crosses above 50 - final confirmation (must fire within 3 candles)"
         }
@@ -66,11 +61,6 @@
           "type": "condition",
           "webhook": "/webhook/ema/9-cross-down-21",
           "comment": "EMA 9 crosses below EMA 21 - short-term momentum shift (primary trigger)"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/macd/cross-down",
-          "comment": "MACD signal line crosses down - momentum confirmation"
         },
         {
           "type": "condition",
