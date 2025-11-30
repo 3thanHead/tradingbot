@@ -16,7 +16,7 @@ services:
       - TAKE_PROFIT_DOLLARS=${TAKE_PROFIT_DOLLARS}
       - TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}
       - STRATEGY=${STRATEGY:-default}
-      - TIMEZONE_OFFSET=${TIMEZONE_OFFSET:-5}
+      - TIMEZONE_OFFSET=${TIMEZONE_OFFSET:-0}
     volumes:
       - ./strategies:/app/strategies:ro
     restart: unless-stopped

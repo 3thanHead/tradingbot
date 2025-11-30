@@ -1,44 +1,39 @@
 {
-  "name": "EMA 9/21 Cross + EMA 50 Filter + RSI Momentum (5min)",
-  "description": "Long: Price above EMA 50, EMA 9 crosses above 21, RSI above 50. Exit on RSI overbought (70), EMA cross reversal, or price below EMA 50. Short: inverse.",
+  "name": "MACD + EMA 9/21 + RSI (5min)",
+  "description": "Entry: MACD cross, EMA 9 cross 21, RSI above/below 50. Exit: MACD cross and Stochastic RSI cross 50.",
   "long": {
     "entry": {
       "combination": "all",
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/ema/price-above-ema50",
-          "comment": "Price above EMA 50 - establishes bullish bias (persistent filter)"
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD bullish cross - momentum trigger"
         },
         {
           "type": "condition",
           "webhook": "/webhook/ema/9-cross-up-21",
-          "comment": "EMA 9 crosses above EMA 21 - bullish momentum trigger"
+          "comment": "EMA 9 crosses above EMA 21 - short-term trend"
         },
         {
           "type": "condition",
           "webhook": "/webhook/rsi/above-50",
-          "comment": "RSI above 50 - bullish momentum (persistent state)"
+          "comment": "RSI above 50 - bullish momentum"
         }
       ]
     },
     "exit": {
-      "combination": "any",
+      "combination": "all",
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/rsi/cross-down-70",
-          "comment": "RSI crosses down from 70 - overbought exhaustion"
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD bearish cross - momentum reversal"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ema/9-cross-down-21",
-          "comment": "EMA 9 crosses below EMA 21 - short-term trend reversal"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/ema/price-cross-down-50",
-          "comment": "Price crosses below EMA 50 - hard stop loss, trend invalidated"
+          "webhook": "/webhook/stochastic-rsi/cross-down-80",
+          "comment": "Stochastic RSI crosses below 80 - overbought exit"
         }
       ]
     }
@@ -49,38 +44,33 @@
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/ema/price-below-ema50",
-          "comment": "Price below EMA 50 - establishes bearish bias (persistent filter)"
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD bearish cross - momentum trigger"
         },
         {
           "type": "condition",
           "webhook": "/webhook/ema/9-cross-down-21",
-          "comment": "EMA 9 crosses below EMA 21 - bearish momentum trigger"
+          "comment": "EMA 9 crosses below EMA 21 - short-term trend"
         },
         {
           "type": "condition",
           "webhook": "/webhook/rsi/below-50",
-          "comment": "RSI below 50 - bearish momentum (persistent state)"
+          "comment": "RSI below 50 - bearish momentum"
         }
       ]
     },
     "exit": {
-      "combination": "any",
+      "combination": "all",
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/rsi/cross-up-30",
-          "comment": "RSI crosses up from 30 - oversold bounce"
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD bullish cross - momentum reversal"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ema/9-cross-up-21",
-          "comment": "EMA 9 crosses above EMA 21 - short-term trend reversal"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/ema/price-cross-up-50",
-          "comment": "Price crosses above EMA 50 - hard stop loss, trend invalidated"
+          "webhook": "/webhook/stochastic-rsi/cross-up-20",
+          "comment": "Stochastic RSI crosses above 20 - oversold exit"
         }
       ]
     }

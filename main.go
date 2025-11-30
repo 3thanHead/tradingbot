@@ -107,6 +107,12 @@ type PositionState struct {
 	StochInOversold   bool // Both K and D lines are in oversold (<20)
 	StochInOverbought bool // Both K and D lines are in overbought (>80)
 
+	// Stochastic RSI indicator tracking
+	StochRSICrossedUp20   bool // Stochastic RSI crossed up above 20
+	StochRSICrossedDown20 bool // Stochastic RSI crossed down below 20
+	StochRSICrossedUp80   bool // Stochastic RSI crossed up above 80
+	StochRSICrossedDown80 bool // Stochastic RSI crossed down below 80
+
 	// RSI trend tracking
 	RSIAbove50 bool // RSI is above 50 (uptrend)
 	RSIBelow50 bool // RSI is below 50 (downtrend)
@@ -733,6 +739,16 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 	case "/webhook/stochastic/overbought":
 		return state.StochInOverbought
 
+	// Stochastic RSI conditions
+	case "/webhook/stochastic-rsi/cross-up-20":
+		return state.StochRSICrossedUp20
+	case "/webhook/stochastic-rsi/cross-down-20":
+		return state.StochRSICrossedDown20
+	case "/webhook/stochastic-rsi/cross-up-80":
+		return state.StochRSICrossedUp80
+	case "/webhook/stochastic-rsi/cross-down-80":
+		return state.StochRSICrossedDown80
+
 	// ATR conditions
 	case "/webhook/atr/above-average":
 		return state.ATRAboveAverage
@@ -1184,6 +1200,9 @@ func handleMACDCrossUp(w http.ResponseWriter, r *http.Request) {
 			closePosition(symbol)
 			state = getPositionState(symbol)
 		}
+		// Don't try to open a position if we're still in a SHORT position
+		respondSuccess(w, "MACD cross up condition set")
+		return
 	}
 
 	// Check if we should open LONG position
@@ -1240,6 +1259,9 @@ func handleMACDCrossDown(w http.ResponseWriter, r *http.Request) {
 			closePosition(symbol)
 			state = getPositionState(symbol)
 		}
+		// Don't try to open a position if we're still in a LONG position
+		respondSuccess(w, "MACD cross down condition set")
+		return
 	}
 
 	// Check if we should open SHORT position
@@ -1299,6 +1321,9 @@ func handleStochasticOversold(w http.ResponseWriter, r *http.Request) {
 			closePosition(symbol)
 			state = getPositionState(symbol)
 		}
+		// Don't try to open a position if we're still in a SHORT position
+		respondSuccess(w, "Stochastic oversold condition set")
+		return
 	}
 
 	// Check if we should open LONG position
@@ -1354,6 +1379,9 @@ func handleStochasticOverbought(w http.ResponseWriter, r *http.Request) {
 			closePosition(symbol)
 			state = getPositionState(symbol)
 		}
+		// Don't try to open a position if we're still in a LONG position
+		respondSuccess(w, "Stochastic overbought condition set")
+		return
 	}
 
 	// Check if we should open SHORT position
@@ -1365,6 +1393,186 @@ func handleStochasticOverbought(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondSuccess(w, "Stochastic overbought condition set")
+}
+
+// ============================================================================
+// STOCHASTIC RSI INDICATOR HANDLERS
+// ============================================================================
+
+// POST /webhook/stochastic-rsi/cross-up-20
+func handleStochRSICrossUp20(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/stochastic-rsi/cross-up-20") {
+		log.Printf("⏭️  [WEBHOOK] Stochastic RSI Cross Up 20 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Stochastic RSI Cross Up 20 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Stochastic RSI crossed UP above 20 for %s", symbol)
+
+	mu.Lock()
+	state.StochRSICrossedUp20 = true
+	state.StochRSICrossedDown20 = false // Reset opposite condition
+	mu.Unlock()
+
+	// Clear entry condition that depended on StochRSICrossedDown20 being true
+	clearEntryConditionForWebhook(symbol, "/webhook/stochastic-rsi/cross-down-20")
+
+	// Check if we should exit SHORT position
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("StochRSI cross up 20: %s → closed SHORT", reason))
+			return
+		}
+		// Don't try to open a position if we're still in a SHORT position
+		respondSuccess(w, "Stochastic RSI crossed up 20 condition set")
+		return
+	}
+
+	respondSuccess(w, "Stochastic RSI crossed up 20 condition set")
+}
+
+// POST /webhook/stochastic-rsi/cross-down-20
+func handleStochRSICrossDown20(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/stochastic-rsi/cross-down-20") {
+		log.Printf("⏭️  [WEBHOOK] Stochastic RSI Cross Down 20 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Stochastic RSI Cross Down 20 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Stochastic RSI crossed DOWN below 20 for %s", symbol)
+
+	mu.Lock()
+	state.StochRSICrossedDown20 = true
+	state.StochRSICrossedUp20 = false // Reset opposite condition
+	mu.Unlock()
+
+	// Clear entry condition that depended on StochRSICrossedUp20 being true
+	clearEntryConditionForWebhook(symbol, "/webhook/stochastic-rsi/cross-up-20")
+
+	respondSuccess(w, "Stochastic RSI crossed down 20 condition set")
+}
+
+// POST /webhook/stochastic-rsi/cross-up-80
+func handleStochRSICrossUp80(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/stochastic-rsi/cross-up-80") {
+		log.Printf("⏭️  [WEBHOOK] Stochastic RSI Cross Up 80 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Stochastic RSI Cross Up 80 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Stochastic RSI crossed UP above 80 for %s", symbol)
+
+	mu.Lock()
+	state.StochRSICrossedUp80 = true
+	state.StochRSICrossedDown80 = false // Reset opposite condition
+	mu.Unlock()
+
+	// Clear entry condition that depended on StochRSICrossedDown80 being true
+	clearEntryConditionForWebhook(symbol, "/webhook/stochastic-rsi/cross-down-80")
+
+	respondSuccess(w, "Stochastic RSI crossed up 80 condition set")
+}
+
+// POST /webhook/stochastic-rsi/cross-down-80
+func handleStochRSICrossDown80(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/stochastic-rsi/cross-down-80") {
+		log.Printf("⏭️  [WEBHOOK] Stochastic RSI Cross Down 80 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Stochastic RSI Cross Down 80 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Stochastic RSI crossed DOWN below 80 for %s", symbol)
+
+	mu.Lock()
+	state.StochRSICrossedDown80 = true
+	state.StochRSICrossedUp80 = false // Reset opposite condition
+	mu.Unlock()
+
+	// Clear entry condition that depended on StochRSICrossedUp80 being true
+	clearEntryConditionForWebhook(symbol, "/webhook/stochastic-rsi/cross-up-80")
+
+	// Check if we should exit LONG position
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("StochRSI cross down 80: %s → closed LONG", reason))
+			return
+		}
+		// Don't try to open a position if we're still in a LONG position
+		respondSuccess(w, "Stochastic RSI crossed down 80 condition set")
+		return
+	}
+
+	respondSuccess(w, "Stochastic RSI crossed down 80 condition set")
 }
 
 // ============================================================================
@@ -1517,6 +1725,9 @@ func handleRSICrossUpOversell25(w http.ResponseWriter, r *http.Request) {
 			respondSuccess(w, fmt.Sprintf("RSI cross up 25: %s → closed SHORT", reason))
 			return
 		}
+		// Don't try to open a position if we're still in a SHORT position
+		respondSuccess(w, "RSI crossed up from oversell 25")
+		return
 	}
 
 	// Check if we should open LONG position
@@ -1564,6 +1775,9 @@ func handleRSICrossOversell30(w http.ResponseWriter, r *http.Request) {
 			closePosition(symbol)
 			state = getPositionState(symbol)
 		}
+		// Don't try to open a position if we're still in a SHORT position
+		respondSuccess(w, "RSI crossed oversell 30")
+		return
 	}
 
 	// Check if we should open LONG position
@@ -1731,8 +1945,10 @@ func handleRSICrossOverbuy70(w http.ResponseWriter, r *http.Request) {
 			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
 			closePosition(symbol)
 			state = getPositionState(symbol)
-			// This allows condition B (which completed the exit) to also count as entry condition for new position
 		}
+		// Don't try to open a position if we're still in a LONG position
+		respondSuccess(w, "RSI crossed overbought 70")
+		return
 	}
 
 	// Check if we should open SHORT position
@@ -1784,9 +2000,13 @@ func handleRSICrossDownOverbuy75(w http.ResponseWriter, r *http.Request) {
 		if shouldExit {
 			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
 			closePosition(symbol)
+			state = getPositionState(symbol)
 			respondSuccess(w, fmt.Sprintf("RSI cross down 75: %s → closed LONG", reason))
 			return
 		}
+		// Don't try to open a position if we're still in a LONG position
+		respondSuccess(w, "RSI crossed down from overbought 75")
+		return
 	}
 
 	// Check if we should open SHORT position
@@ -1877,8 +2097,10 @@ func handlePriceBelowEMA20(w http.ResponseWriter, r *http.Request) {
 			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
 			closePosition(symbol)
 			state = getPositionState(symbol)
-			shouldOpenPosition(symbol, false, r)
 		}
+		// Don't try to open a position if we're still in a LONG position
+		respondSuccess(w, "Price below EMA20 condition set")
+		return
 	}
 
 	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
@@ -3333,8 +3555,47 @@ func openLongPosition(symbol string, price string) {
 		// Clear all state machine for fresh events after entry
 		state.EntryConditionsCompleted = make(map[string]bool)
 		state.ExitConditionsCompleted = make(map[string]bool)
+		// Reset all indicator state flags
 		state.MACDCrossedUp = false
 		state.MACDCrossedDown = false
+		state.StochInOversold = false
+		state.StochInOverbought = false
+		state.StochRSICrossedUp20 = false
+		state.StochRSICrossedDown20 = false
+		state.StochRSICrossedUp80 = false
+		state.StochRSICrossedDown80 = false
+		state.RSIAbove50 = false
+		state.RSIBelow50 = false
+		state.RSICrossedUp25 = false
+		state.RSICrossedDown25 = false
+		state.RSICrossedUp30 = false
+		state.RSICrossedDown30 = false
+		state.RSICrossedUp40 = false
+		state.RSICrossedDown40 = false
+		state.RSICrossedUp60 = false
+		state.RSICrossedDown60 = false
+		state.RSICrossedUp70 = false
+		state.RSICrossedDown70 = false
+		state.RSICrossedUp75 = false
+		state.RSICrossedDown75 = false
+		state.PriceAboveEMA9 = false
+		state.PriceBelowEMA9 = false
+		state.PriceAboveEMA20 = false
+		state.PriceBelowEMA20 = false
+		state.PriceAboveEMA50 = false
+		state.PriceBelowEMA50 = false
+		state.PriceAboveEMA200 = false
+		state.PriceBelowEMA200 = false
+		state.EMA9CrossedUpEMA21 = false
+		state.EMA9CrossedDownEMA21 = false
+		state.ATRAboveAverage = false
+		state.ATRBelowAverage = false
+		state.MACDHistIncreasing = false
+		state.MACDHistDecreasing = false
+		state.MACDHistAboveZero = false
+		state.MACDHistBelowZero = false
+		state.MARibbonBullish = false
+		state.MARibbonBearish = false
 		mu.Unlock()
 
 		log.Println(strings.Repeat("🟢", 40))
@@ -3374,8 +3635,47 @@ func openLongPosition(symbol string, price string) {
 	// Clear all state machine for fresh events after entry
 	state.EntryConditionsCompleted = make(map[string]bool)
 	state.ExitConditionsCompleted = make(map[string]bool)
+	// Reset all indicator state flags
 	state.MACDCrossedUp = false
 	state.MACDCrossedDown = false
+	state.StochInOversold = false
+	state.StochInOverbought = false
+	state.StochRSICrossedUp20 = false
+	state.StochRSICrossedDown20 = false
+	state.StochRSICrossedUp80 = false
+	state.StochRSICrossedDown80 = false
+	state.RSIAbove50 = false
+	state.RSIBelow50 = false
+	state.RSICrossedUp25 = false
+	state.RSICrossedDown25 = false
+	state.RSICrossedUp30 = false
+	state.RSICrossedDown30 = false
+	state.RSICrossedUp40 = false
+	state.RSICrossedDown40 = false
+	state.RSICrossedUp60 = false
+	state.RSICrossedDown60 = false
+	state.RSICrossedUp70 = false
+	state.RSICrossedDown70 = false
+	state.RSICrossedUp75 = false
+	state.RSICrossedDown75 = false
+	state.PriceAboveEMA9 = false
+	state.PriceBelowEMA9 = false
+	state.PriceAboveEMA20 = false
+	state.PriceBelowEMA20 = false
+	state.PriceAboveEMA50 = false
+	state.PriceBelowEMA50 = false
+	state.PriceAboveEMA200 = false
+	state.PriceBelowEMA200 = false
+	state.EMA9CrossedUpEMA21 = false
+	state.EMA9CrossedDownEMA21 = false
+	state.ATRAboveAverage = false
+	state.ATRBelowAverage = false
+	state.MACDHistIncreasing = false
+	state.MACDHistDecreasing = false
+	state.MACDHistAboveZero = false
+	state.MACDHistBelowZero = false
+	state.MARibbonBullish = false
+	state.MARibbonBearish = false
 	mu.Unlock()
 
 	log.Printf("✅ LONG position opened: %s (ID: %s)", symbol, tradeID)
@@ -3401,8 +3701,47 @@ func openShortPosition(symbol string, price string) {
 		// Clear all state machine for fresh events after entry
 		state.EntryConditionsCompleted = make(map[string]bool)
 		state.ExitConditionsCompleted = make(map[string]bool)
+		// Reset all indicator state flags
 		state.MACDCrossedUp = false
 		state.MACDCrossedDown = false
+		state.StochInOversold = false
+		state.StochInOverbought = false
+		state.StochRSICrossedUp20 = false
+		state.StochRSICrossedDown20 = false
+		state.StochRSICrossedUp80 = false
+		state.StochRSICrossedDown80 = false
+		state.RSIAbove50 = false
+		state.RSIBelow50 = false
+		state.RSICrossedUp25 = false
+		state.RSICrossedDown25 = false
+		state.RSICrossedUp30 = false
+		state.RSICrossedDown30 = false
+		state.RSICrossedUp40 = false
+		state.RSICrossedDown40 = false
+		state.RSICrossedUp60 = false
+		state.RSICrossedDown60 = false
+		state.RSICrossedUp70 = false
+		state.RSICrossedDown70 = false
+		state.RSICrossedUp75 = false
+		state.RSICrossedDown75 = false
+		state.PriceAboveEMA9 = false
+		state.PriceBelowEMA9 = false
+		state.PriceAboveEMA20 = false
+		state.PriceBelowEMA20 = false
+		state.PriceAboveEMA50 = false
+		state.PriceBelowEMA50 = false
+		state.PriceAboveEMA200 = false
+		state.PriceBelowEMA200 = false
+		state.EMA9CrossedUpEMA21 = false
+		state.EMA9CrossedDownEMA21 = false
+		state.ATRAboveAverage = false
+		state.ATRBelowAverage = false
+		state.MACDHistIncreasing = false
+		state.MACDHistDecreasing = false
+		state.MACDHistAboveZero = false
+		state.MACDHistBelowZero = false
+		state.MARibbonBullish = false
+		state.MARibbonBearish = false
 		mu.Unlock()
 
 		log.Println(strings.Repeat("🔴", 40))
@@ -3442,8 +3781,47 @@ func openShortPosition(symbol string, price string) {
 	// Clear all state machine for fresh events after entry
 	state.EntryConditionsCompleted = make(map[string]bool)
 	state.ExitConditionsCompleted = make(map[string]bool)
+	// Reset all indicator state flags
 	state.MACDCrossedUp = false
 	state.MACDCrossedDown = false
+	state.StochInOversold = false
+	state.StochInOverbought = false
+	state.StochRSICrossedUp20 = false
+	state.StochRSICrossedDown20 = false
+	state.StochRSICrossedUp80 = false
+	state.StochRSICrossedDown80 = false
+	state.RSIAbove50 = false
+	state.RSIBelow50 = false
+	state.RSICrossedUp25 = false
+	state.RSICrossedDown25 = false
+	state.RSICrossedUp30 = false
+	state.RSICrossedDown30 = false
+	state.RSICrossedUp40 = false
+	state.RSICrossedDown40 = false
+	state.RSICrossedUp60 = false
+	state.RSICrossedDown60 = false
+	state.RSICrossedUp70 = false
+	state.RSICrossedDown70 = false
+	state.RSICrossedUp75 = false
+	state.RSICrossedDown75 = false
+	state.PriceAboveEMA9 = false
+	state.PriceBelowEMA9 = false
+	state.PriceAboveEMA20 = false
+	state.PriceBelowEMA20 = false
+	state.PriceAboveEMA50 = false
+	state.PriceBelowEMA50 = false
+	state.PriceAboveEMA200 = false
+	state.PriceBelowEMA200 = false
+	state.EMA9CrossedUpEMA21 = false
+	state.EMA9CrossedDownEMA21 = false
+	state.ATRAboveAverage = false
+	state.ATRBelowAverage = false
+	state.MACDHistIncreasing = false
+	state.MACDHistDecreasing = false
+	state.MACDHistAboveZero = false
+	state.MACDHistBelowZero = false
+	state.MARibbonBullish = false
+	state.MARibbonBearish = false
 	mu.Unlock()
 
 	log.Printf("✅ SHORT position opened: %s (ID: %s)", symbol, tradeID)
@@ -3491,6 +3869,47 @@ func closePosition(symbol string) {
 		// Clear all state machine for fresh entry signals
 		state.EntryConditionsCompleted = make(map[string]bool)
 		state.ExitConditionsCompleted = make(map[string]bool)
+		// Reset all indicator state flags
+		state.MACDCrossedUp = false
+		state.MACDCrossedDown = false
+		state.StochInOversold = false
+		state.StochInOverbought = false
+		state.StochRSICrossedUp20 = false
+		state.StochRSICrossedDown20 = false
+		state.StochRSICrossedUp80 = false
+		state.StochRSICrossedDown80 = false
+		state.RSIAbove50 = false
+		state.RSIBelow50 = false
+		state.RSICrossedUp25 = false
+		state.RSICrossedDown25 = false
+		state.RSICrossedUp30 = false
+		state.RSICrossedDown30 = false
+		state.RSICrossedUp40 = false
+		state.RSICrossedDown40 = false
+		state.RSICrossedUp60 = false
+		state.RSICrossedDown60 = false
+		state.RSICrossedUp70 = false
+		state.RSICrossedDown70 = false
+		state.RSICrossedUp75 = false
+		state.RSICrossedDown75 = false
+		state.PriceAboveEMA9 = false
+		state.PriceBelowEMA9 = false
+		state.PriceAboveEMA20 = false
+		state.PriceBelowEMA20 = false
+		state.PriceAboveEMA50 = false
+		state.PriceBelowEMA50 = false
+		state.PriceAboveEMA200 = false
+		state.PriceBelowEMA200 = false
+		state.EMA9CrossedUpEMA21 = false
+		state.EMA9CrossedDownEMA21 = false
+		state.ATRAboveAverage = false
+		state.ATRBelowAverage = false
+		state.MACDHistIncreasing = false
+		state.MACDHistDecreasing = false
+		state.MACDHistAboveZero = false
+		state.MACDHistBelowZero = false
+		state.MARibbonBullish = false
+		state.MARibbonBearish = false
 		mu.Unlock()
 
 		return
@@ -3521,9 +3940,50 @@ func closePosition(symbol string) {
 		state.PositionOpen = false
 		state.Position = "none"
 		state.TradeID = ""
-		// Reset all state machine flags
+		// Clear all state machine for fresh entry signals
+		state.EntryConditionsCompleted = make(map[string]bool)
+		state.ExitConditionsCompleted = make(map[string]bool)
+		// Reset all indicator state flags
 		state.MACDCrossedUp = false
 		state.MACDCrossedDown = false
+		state.StochInOversold = false
+		state.StochInOverbought = false
+		state.StochRSICrossedUp20 = false
+		state.StochRSICrossedDown20 = false
+		state.StochRSICrossedUp80 = false
+		state.StochRSICrossedDown80 = false
+		state.RSIAbove50 = false
+		state.RSIBelow50 = false
+		state.RSICrossedUp25 = false
+		state.RSICrossedDown25 = false
+		state.RSICrossedUp30 = false
+		state.RSICrossedDown30 = false
+		state.RSICrossedUp40 = false
+		state.RSICrossedDown40 = false
+		state.RSICrossedUp60 = false
+		state.RSICrossedDown60 = false
+		state.RSICrossedUp70 = false
+		state.RSICrossedDown70 = false
+		state.RSICrossedUp75 = false
+		state.RSICrossedDown75 = false
+		state.PriceAboveEMA9 = false
+		state.PriceBelowEMA9 = false
+		state.PriceAboveEMA20 = false
+		state.PriceBelowEMA20 = false
+		state.PriceAboveEMA50 = false
+		state.PriceBelowEMA50 = false
+		state.PriceAboveEMA200 = false
+		state.PriceBelowEMA200 = false
+		state.EMA9CrossedUpEMA21 = false
+		state.EMA9CrossedDownEMA21 = false
+		state.ATRAboveAverage = false
+		state.ATRBelowAverage = false
+		state.MACDHistIncreasing = false
+		state.MACDHistDecreasing = false
+		state.MACDHistAboveZero = false
+		state.MACDHistBelowZero = false
+		state.MARibbonBullish = false
+		state.MARibbonBearish = false
 		mu.Unlock()
 
 		log.Printf("✅ Position closed: %s", symbol)
@@ -3999,6 +4459,12 @@ func main() {
 	// Stochastic Webhooks
 	http.HandleFunc("/webhook/stochastic/oversold", handleStochasticOversold)
 	http.HandleFunc("/webhook/stochastic/overbought", handleStochasticOverbought)
+
+	// Stochastic RSI Webhooks
+	http.HandleFunc("/webhook/stochastic-rsi/cross-up-20", handleStochRSICrossUp20)
+	http.HandleFunc("/webhook/stochastic-rsi/cross-down-20", handleStochRSICrossDown20)
+	http.HandleFunc("/webhook/stochastic-rsi/cross-up-80", handleStochRSICrossUp80)
+	http.HandleFunc("/webhook/stochastic-rsi/cross-down-80", handleStochRSICrossDown80)
 
 	// RSI Trend Webhooks
 	http.HandleFunc("/webhook/rsi/above-50", handleRSIAbove50)
