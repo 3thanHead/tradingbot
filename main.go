@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,11 @@ type PositionState struct {
 	PositionOpen    bool
 	Position        string // "long" or "short"
 	TradeID         string
+	Exchange        string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
+	IsSimulated     bool    // True if this is a simulated trade (non-OANDA)
+	SimulatedEntry  string  // Entry time for simulated trade
+	SimulatedExit   string  // Exit time for simulated trade
+	SimulatedPrice  string  // Entry price for simulated trade
 	MACDCrossedUp   bool    // Tracks if MACD crossed up
 	MACDCrossedDown bool    // Tracks if MACD crossed down
 	SwingHigh       float64 // Latest swing high price level
@@ -170,8 +176,11 @@ var (
 	takeProfitDollars string                               // Take profit in dollar amount (e.g., "100" for $100 gain)
 
 	// Strategy system
-	activeStrategy Strategy // Currently loaded strategy
-	strategyName   string   // Name of strategy file to load
+	activeStrategy          Strategy  // Currently loaded strategy
+	strategyName            string    // Name of strategy file to load
+	firstWebhookStatusShown bool      // Track if first webhook status has been shown
+	lastStatusReportTime    time.Time // Track last time status was reported
+	timezoneOffset          int       // Timezone offset in hours (e.g., -5 for UTC-5, 0 for UTC)
 )
 
 // Get or create position state for a symbol
@@ -641,6 +650,10 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.RSIAbove50
 	case "/webhook/rsi/cross-down-50":
 		return state.RSIBelow50
+	case "/webhook/rsi/above-50":
+		return state.RSIAbove50
+	case "/webhook/rsi/below-50":
+		return state.RSIBelow50
 	case "/webhook/rsi/cross-up-30":
 		return state.RSICrossedUp30
 	case "/webhook/rsi/cross-down-30":
@@ -691,6 +704,10 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.EMA9CrossedUpEMA21
 	case "/webhook/ema/9-cross-down-21":
 		return state.EMA9CrossedDownEMA21
+	case "/webhook/ema/9-above-21":
+		return state.EMA9CrossedUpEMA21
+	case "/webhook/ema/9-below-21":
+		return state.EMA9CrossedDownEMA21
 	case "/webhook/ema/price-cross-down-50":
 		return state.PriceBelowEMA50 // Crossing down means now below
 	case "/webhook/ema/price-cross-up-50":
@@ -704,6 +721,10 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 	case "/webhook/macd/histogram-cross-up-0":
 		return state.MACDHistAboveZero
 	case "/webhook/macd/histogram-cross-down-0":
+		return state.MACDHistBelowZero
+	case "/webhook/macd/histogram-above-0":
+		return state.MACDHistAboveZero
+	case "/webhook/macd/histogram-below-0":
 		return state.MACDHistBelowZero
 
 	// Stochastic conditions
@@ -1030,9 +1051,6 @@ func clearEntryConditionForWebhook(symbol string, webhookPath string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	log.Printf("🔍 [DEBUG] clearEntryConditionForWebhook called for %s, webhook: %s", symbol, webhookPath)
-	log.Printf("🔍 [DEBUG] Current EntryConditionsCompleted: %+v", state.EntryConditionsCompleted)
-
 	// Helper to clear from a specific entry conditions structure
 	clearFromConditions := func(entryConditions *EntryConditions, prefix string) {
 		if entryConditions == nil {
@@ -1042,10 +1060,9 @@ func clearEntryConditionForWebhook(symbol string, webhookPath string) {
 		for i, condition := range entryConditions.Conditions {
 			if condition.Type == "condition" && condition.Webhook == webhookPath {
 				conditionKey := fmt.Sprintf("%scondition_%d", prefix, i)
-				log.Printf("🔍 [DEBUG] Found matching condition at index %d, key: %s, currently set: %v", i, conditionKey, state.EntryConditionsCompleted[conditionKey])
 				if state.EntryConditionsCompleted[conditionKey] {
 					delete(state.EntryConditionsCompleted, conditionKey)
-					log.Printf("🧹 [STATE] Cleared stale entry condition: %s (key: %s, state now false)", webhookPath, conditionKey)
+					log.Printf("🧹 [STATE] Cleared stale entry condition: %s (state now false)", webhookPath)
 				}
 				break
 			}
@@ -1054,22 +1071,17 @@ func clearEntryConditionForWebhook(symbol string, webhookPath string) {
 
 	// Check unified format (same entry/exit for both long and short)
 	if activeStrategy.Entry != nil {
-		log.Printf("🔍 [DEBUG] Checking unified entry conditions")
 		clearFromConditions(activeStrategy.Entry, "")
 	}
 
 	// Check separate format (long and short have their own entry/exit)
 	// Need to clear from BOTH since we don't know which direction is being attempted
 	if activeStrategy.Long != nil {
-		log.Printf("🔍 [DEBUG] Checking LONG entry conditions")
 		clearFromConditions(&activeStrategy.Long.Entry, "long_")
 	}
 	if activeStrategy.Short != nil {
-		log.Printf("🔍 [DEBUG] Checking SHORT entry conditions")
 		clearFromConditions(&activeStrategy.Short.Entry, "short_")
 	}
-
-	log.Printf("🔍 [DEBUG] After clearing, EntryConditionsCompleted: %+v", state.EntryConditionsCompleted)
 }
 
 // Helper: Check if a webhook path is used in the active strategy
@@ -1383,7 +1395,12 @@ func handleRSIAbove50(w http.ResponseWriter, r *http.Request) {
 	symbol := normalizeSymbol(event.Ticker)
 	state := getPositionState(symbol)
 
-	log.Printf("📊 RSI crossed ABOVE 50 (uptrend) for %s", symbol)
+	// Store exchange information
+	mu.Lock()
+	state.Exchange = event.Exchange
+	mu.Unlock()
+
+	log.Printf("📊 RSI crossed ABOVE 50 (uptrend) for %s [%s]", symbol, event.Exchange)
 
 	mu.Lock()
 	state.RSIAbove50 = true
@@ -2368,8 +2385,6 @@ func handleRSICrossDown50(w http.ResponseWriter, r *http.Request) {
 	// Clear entry condition that depended on RSIAbove50 being true
 	clearEntryConditionForWebhook(symbol, "/webhook/rsi/cross-up-50")
 
-	log.Printf("🔍 [DEBUG] After clearing, LONG entry conditions: %+v", state.EntryConditionsCompleted)
-
 	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
 		openShortPosition(symbol, event.Close)
@@ -2514,6 +2529,100 @@ func handleMACDHistCrossDown0(w http.ResponseWriter, r *http.Request) {
 	respondSuccess(w, "MACD histogram cross down 0 condition set")
 }
 
+// POST /webhook/macd/histogram-above-0
+func handleMACDHistAbove0(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/macd/histogram-above-0") {
+		log.Printf("⏭️  [WEBHOOK] MACD Histogram Above 0 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MACD Histogram Above 0 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 MACD Histogram is above zero for %s", symbol)
+
+	mu.Lock()
+	state.MACDHistAboveZero = true
+	state.MACDHistBelowZero = false
+	mu.Unlock()
+
+	// Check if we should exit SHORT position
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+	}
+
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MACD histogram above 0 + strategy → LONG opened")
+		return
+	}
+
+	respondSuccess(w, "MACD histogram above 0 condition set")
+}
+
+// POST /webhook/macd/histogram-below-0
+func handleMACDHistBelow0(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/macd/histogram-below-0") {
+		log.Printf("⏭️  [WEBHOOK] MACD Histogram Below 0 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MACD Histogram Below 0 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 MACD Histogram is below zero for %s", symbol)
+
+	mu.Lock()
+	state.MACDHistBelowZero = true
+	state.MACDHistAboveZero = false
+	mu.Unlock()
+
+	// Check if we should exit LONG position
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+	}
+
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MACD histogram below 0 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MACD histogram below 0 condition set")
+}
+
 // POST /webhook/ema/9-cross-up-21
 func handleEMA9CrossUp21(w http.ResponseWriter, r *http.Request) {
 	if !isWebhookUsedInStrategy("/webhook/ema/9-cross-up-21") {
@@ -2616,6 +2725,103 @@ func handleEMA9CrossDown21(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondSuccess(w, "EMA 9 cross down 21 condition set")
+}
+
+// POST /webhook/ema/9-above-21
+func handleEMA9Above21(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ema/9-above-21") {
+		log.Printf("⏭️  [WEBHOOK] EMA 9 Above 21 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received EMA 9 Above 21 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 EMA 9 is above EMA 21 for %s", symbol)
+
+	// Update EMA state
+	mu.Lock()
+	state.EMA9CrossedUpEMA21 = true
+	state.EMA9CrossedDownEMA21 = false
+	mu.Unlock()
+
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "EMA 9 above 21 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should exit SHORT position
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("EMA 9 above 21: %s → closed SHORT", reason))
+			return
+		}
+	}
+
+	respondSuccess(w, "EMA 9 above 21 condition set")
+}
+
+// POST /webhook/ema/9-below-21
+func handleEMA9Below21(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ema/9-below-21") {
+		log.Printf("⏭️  [WEBHOOK] EMA 9 Below 21 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received EMA 9 Below 21 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 EMA 9 is below EMA 21 for %s", symbol)
+
+	// Update EMA state
+	mu.Lock()
+	state.EMA9CrossedDownEMA21 = true
+	state.EMA9CrossedUpEMA21 = false
+	mu.Unlock()
+
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, fmt.Sprintf("EMA 9 below 21: %s → closed LONG", reason))
+			return
+		}
+	}
+
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "EMA 9 below 21 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "EMA 9 below 21 condition set")
 }
 
 // POST /webhook/ema/price-cross-down-50
@@ -3110,6 +3316,41 @@ func syncPositionsFromOanda() error {
 }
 
 func openLongPosition(symbol string, price string) {
+	mu.Lock()
+	state := positions[symbol]
+	exchange := state.Exchange
+	mu.Unlock()
+
+	// Check if this is a non-OANDA exchange (simulated trade)
+	if exchange != "OANDA" && exchange != "" {
+		mu.Lock()
+		state.PositionOpen = true
+		state.Position = "long"
+		state.IsSimulated = true
+		state.SimulatedEntry = formatTimeWithZone(getLocalTime())
+		state.SimulatedPrice = price
+		state.TradeID = fmt.Sprintf("SIM-%s-%d", symbol, time.Now().Unix())
+		// Clear all state machine for fresh events after entry
+		state.EntryConditionsCompleted = make(map[string]bool)
+		state.ExitConditionsCompleted = make(map[string]bool)
+		state.MACDCrossedUp = false
+		state.MACDCrossedDown = false
+		mu.Unlock()
+
+		log.Println(strings.Repeat("🟢", 40))
+		log.Printf("📊 SIMULATED LONG TRADE - %s", exchange)
+		log.Println(strings.Repeat("🟢", 40))
+		log.Printf("Symbol: %s", symbol)
+		log.Printf("Entry Time: %s", state.SimulatedEntry)
+		log.Printf("Entry Price: %s", price)
+		log.Printf("Trade ID: %s", state.TradeID)
+		log.Println(strings.Repeat("🟢", 40))
+		log.Println("⚠️  MANUAL ACTION REQUIRED: Mark this entry in TradingView")
+		log.Println(strings.Repeat("🟢", 40))
+		return
+	}
+
+	// Real OANDA trade
 	orderSpec := getTradeSpec(symbol, true) // true = LONG
 
 	orderData := map[string]interface{}{
@@ -3125,10 +3366,11 @@ func openLongPosition(symbol string, price string) {
 	}
 
 	mu.Lock()
-	state := positions[symbol]
+	state = positions[symbol]
 	state.PositionOpen = true
 	state.Position = "long"
 	state.TradeID = tradeID
+	state.IsSimulated = false
 	// Clear all state machine for fresh events after entry
 	state.EntryConditionsCompleted = make(map[string]bool)
 	state.ExitConditionsCompleted = make(map[string]bool)
@@ -3142,6 +3384,41 @@ func openLongPosition(symbol string, price string) {
 }
 
 func openShortPosition(symbol string, price string) {
+	mu.Lock()
+	state := positions[symbol]
+	exchange := state.Exchange
+	mu.Unlock()
+
+	// Check if this is a non-OANDA exchange (simulated trade)
+	if exchange != "OANDA" && exchange != "" {
+		mu.Lock()
+		state.PositionOpen = true
+		state.Position = "short"
+		state.IsSimulated = true
+		state.SimulatedEntry = formatTimeWithZone(getLocalTime())
+		state.SimulatedPrice = price
+		state.TradeID = fmt.Sprintf("SIM-%s-%d", symbol, time.Now().Unix())
+		// Clear all state machine for fresh events after entry
+		state.EntryConditionsCompleted = make(map[string]bool)
+		state.ExitConditionsCompleted = make(map[string]bool)
+		state.MACDCrossedUp = false
+		state.MACDCrossedDown = false
+		mu.Unlock()
+
+		log.Println(strings.Repeat("🔴", 40))
+		log.Printf("📊 SIMULATED SHORT TRADE - %s", exchange)
+		log.Println(strings.Repeat("🔴", 40))
+		log.Printf("Symbol: %s", symbol)
+		log.Printf("Entry Time: %s", state.SimulatedEntry)
+		log.Printf("Entry Price: %s", price)
+		log.Printf("Trade ID: %s", state.TradeID)
+		log.Println(strings.Repeat("🔴", 40))
+		log.Println("⚠️  MANUAL ACTION REQUIRED: Mark this entry in TradingView")
+		log.Println(strings.Repeat("🔴", 40))
+		return
+	}
+
+	// Real OANDA trade
 	orderSpec := getTradeSpec(symbol, false) // false = SHORT
 
 	orderData := map[string]interface{}{
@@ -3157,10 +3434,11 @@ func openShortPosition(symbol string, price string) {
 	}
 
 	mu.Lock()
-	state := positions[symbol]
+	state = positions[symbol]
 	state.PositionOpen = true
 	state.Position = "short"
 	state.TradeID = tradeID
+	state.IsSimulated = false
 	// Clear all state machine for fresh events after entry
 	state.EntryConditionsCompleted = make(map[string]bool)
 	state.ExitConditionsCompleted = make(map[string]bool)
@@ -3178,6 +3456,10 @@ func closePosition(symbol string) {
 	state := positions[symbol]
 	tradeID := state.TradeID
 	position := state.Position
+	isSimulated := state.IsSimulated
+	exchange := state.Exchange
+	entryTime := state.SimulatedEntry
+	entryPrice := state.SimulatedPrice
 	mu.RUnlock()
 
 	if tradeID == "" {
@@ -3185,6 +3467,36 @@ func closePosition(symbol string) {
 		return
 	}
 
+	// Handle simulated trade close
+	if isSimulated {
+		exitTime := formatTimeWithZone(getLocalTime())
+
+		log.Println(strings.Repeat("🔵", 40))
+		log.Printf("📊 SIMULATED %s TRADE CLOSED - %s", strings.ToUpper(position), exchange)
+		log.Println(strings.Repeat("🔵", 40))
+		log.Printf("Symbol: %s", symbol)
+		log.Printf("Entry Time: %s", entryTime)
+		log.Printf("Entry Price: %s", entryPrice)
+		log.Printf("Exit Time: %s", exitTime)
+		log.Printf("Trade ID: %s", tradeID)
+		log.Println(strings.Repeat("🔵", 40))
+		log.Println("⚠️  MANUAL ACTION REQUIRED: Mark this exit in TradingView")
+		log.Println(strings.Repeat("🔵", 40))
+
+		mu.Lock()
+		state.PositionOpen = false
+		state.Position = ""
+		state.TradeID = ""
+		state.SimulatedExit = exitTime
+		// Clear all state machine for fresh entry signals
+		state.EntryConditionsCompleted = make(map[string]bool)
+		state.ExitConditionsCompleted = make(map[string]bool)
+		mu.Unlock()
+
+		return
+	}
+
+	// Real OANDA trade close
 	log.Printf("🔵 Closing %s position for %s (ID: %s)", position, symbol, tradeID)
 
 	url := fmt.Sprintf("%s/v3/accounts/%s/trades/%s/close", oandaBaseURL, oandaAccountID, tradeID)
@@ -3299,7 +3611,26 @@ func normalizeSymbol(ticker string) string {
 	return ticker
 }
 
+// getLocalTime returns current time adjusted for timezone offset
+func getLocalTime() time.Time {
+	return time.Now().UTC().Add(time.Duration(timezoneOffset) * time.Hour)
+}
+
+// formatTimeWithZone formats time with timezone label
+func formatTimeWithZone(t time.Time) string {
+	if timezoneOffset == 0 {
+		return t.Format("2006-01-02 03:04:05 PM") + " UTC"
+	} else if timezoneOffset > 0 {
+		return t.Format("2006-01-02 03:04:05 PM") + fmt.Sprintf(" UTC+%d", timezoneOffset)
+	} else {
+		return t.Format("2006-01-02 03:04:05 PM") + fmt.Sprintf(" UTC%d", timezoneOffset)
+	}
+}
+
 func respondSuccess(w http.ResponseWriter, message string) {
+	// Show status report after each webhook event
+	reportStrategyStatus()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "success",
@@ -3338,7 +3669,7 @@ func reportStrategyStatus() {
 	defer mu.Unlock()
 
 	log.Println(strings.Repeat("=", 80))
-	log.Printf("📊 STRATEGY STATUS REPORT - %s", time.Now().Format("2006-01-02 15:04:05"))
+	log.Printf("📊 STRATEGY STATUS REPORT - %s", formatTimeWithZone(getLocalTime()))
 	log.Println(strings.Repeat("=", 80))
 	log.Printf("Strategy: %s", activeStrategy.Name)
 	log.Println("")
@@ -3381,39 +3712,67 @@ func reportStrategyStatus() {
 
 	// Report for each symbol
 	for symbol, state := range positions {
-		log.Printf("Symbol: %s", symbol)
+		exchangeTag := ""
+		if state.Exchange != "" {
+			exchangeTag = fmt.Sprintf(" [%s]", state.Exchange)
+		}
+		log.Printf("Symbol: %s%s", symbol, exchangeTag)
+
 		if state.PositionOpen {
-			log.Printf("  Position: %s (Trade ID: %s)", strings.ToUpper(state.Position), state.TradeID)
+			// Visual indicator for open position
+			if state.IsSimulated {
+				log.Println("  ┌─────────────────────────────────────────────────────────────────────┐")
+				log.Printf("  │ 🔄 SIMULATED %s POSITION - %s%-29s│",
+					strings.ToUpper(state.Position), state.Exchange, "")
+				log.Printf("  │ Entry: %s @ %s%-33s│",
+					state.SimulatedEntry, state.SimulatedPrice, "")
+				log.Printf("  │ Trade ID: %s%-48s│", state.TradeID, "")
+				log.Println("  └─────────────────────────────────────────────────────────────────────┘")
+			} else {
+				log.Println("  ┌─────────────────────────────────────────────────────────────────────┐")
+				log.Printf("  │ 📈 POSITION OPEN: %s (Trade ID: %s)%-24s│",
+					strings.ToUpper(state.Position), state.TradeID, "")
+				log.Println("  └─────────────────────────────────────────────────────────────────────┘")
+			}
+			log.Println("")
+
+			// Show ONLY exit conditions for the current position
+			if state.Position == "long" {
+				if activeStrategy.Long != nil {
+					reportExitConditions(symbol, "LONG", &activeStrategy.Long.Exit, "long_", state)
+				} else if activeStrategy.Exit != nil {
+					reportExitConditions(symbol, "LONG", activeStrategy.Exit, "", state)
+				}
+			} else if state.Position == "short" {
+				if activeStrategy.Short != nil {
+					reportExitConditions(symbol, "SHORT", &activeStrategy.Short.Exit, "short_", state)
+				} else if activeStrategy.Exit != nil {
+					reportExitConditions(symbol, "SHORT", activeStrategy.Exit, "", state)
+				}
+			}
 		} else {
-			log.Printf("  Position: NONE")
-		}
-		log.Println("")
-
-		// Report LONG entry conditions
-		if activeStrategy.Long != nil {
-			reportEntryConditions(symbol, "LONG", &activeStrategy.Long.Entry, "long_", state)
-			if state.PositionOpen && state.Position == "long" {
-				reportExitConditions(symbol, "LONG", &activeStrategy.Long.Exit, "long_", state)
+			exchangeInfo := ""
+			if state.Exchange != "" {
+				exchangeInfo = fmt.Sprintf(" [%s]", state.Exchange)
 			}
-		} else if activeStrategy.Entry != nil {
-			reportEntryConditions(symbol, "LONG", activeStrategy.Entry, "", state)
-			if activeStrategy.Exit != nil && state.PositionOpen && state.Position == "long" {
-				reportExitConditions(symbol, "LONG", activeStrategy.Exit, "", state)
-			}
-		}
+			log.Printf("  Position: NONE%s", exchangeInfo)
+			log.Println("")
 
-		log.Println("")
-
-		// Report SHORT entry conditions
-		if activeStrategy.Short != nil {
-			reportEntryConditions(symbol, "SHORT", &activeStrategy.Short.Entry, "short_", state)
-			if state.PositionOpen && state.Position == "short" {
-				reportExitConditions(symbol, "SHORT", &activeStrategy.Short.Exit, "short_", state)
+			// Show entry conditions for both directions when no position is open
+			// Report LONG entry conditions
+			if activeStrategy.Long != nil {
+				reportEntryConditions(symbol, "LONG", &activeStrategy.Long.Entry, "long_", state)
+			} else if activeStrategy.Entry != nil {
+				reportEntryConditions(symbol, "LONG", activeStrategy.Entry, "", state)
 			}
-		} else if activeStrategy.Entry != nil {
-			reportEntryConditions(symbol, "SHORT", activeStrategy.Entry, "", state)
-			if activeStrategy.Exit != nil && state.PositionOpen && state.Position == "short" {
-				reportExitConditions(symbol, "SHORT", activeStrategy.Exit, "", state)
+
+			log.Println("")
+
+			// Report SHORT entry conditions
+			if activeStrategy.Short != nil {
+				reportEntryConditions(symbol, "SHORT", &activeStrategy.Short.Entry, "short_", state)
+			} else if activeStrategy.Entry != nil {
+				reportEntryConditions(symbol, "SHORT", activeStrategy.Entry, "", state)
 			}
 		}
 
@@ -3560,6 +3919,20 @@ func main() {
 		strategyName = "default" // Use default strategy if not specified
 	}
 
+	// Timezone configuration
+	timezoneOffsetStr := os.Getenv("TIMEZONE_OFFSET")
+	if timezoneOffsetStr != "" {
+		if offset, err := strconv.Atoi(timezoneOffsetStr); err == nil {
+			timezoneOffset = offset
+			log.Printf("⏰ Timezone offset: UTC%+d", timezoneOffset)
+		} else {
+			log.Printf("⚠️  Invalid TIMEZONE_OFFSET value '%s', using UTC (0)", timezoneOffsetStr)
+			timezoneOffset = 0
+		}
+	} else {
+		timezoneOffset = 0 // Default to UTC
+	}
+
 	// Default to 100 units if nothing specified
 	if tradeUnits == "" && tradeUSDAmount == "" && tradeMargin == "" {
 		tradeUnits = "100"
@@ -3650,10 +4023,14 @@ func main() {
 	// MACD Histogram Webhooks
 	http.HandleFunc("/webhook/macd/histogram-cross-up-0", handleMACDHistCrossUp0)
 	http.HandleFunc("/webhook/macd/histogram-cross-down-0", handleMACDHistCrossDown0)
+	http.HandleFunc("/webhook/macd/histogram-above-0", handleMACDHistAbove0)
+	http.HandleFunc("/webhook/macd/histogram-below-0", handleMACDHistBelow0)
 
 	// EMA Cross Webhooks
 	http.HandleFunc("/webhook/ema/9-cross-up-21", handleEMA9CrossUp21)
 	http.HandleFunc("/webhook/ema/9-cross-down-21", handleEMA9CrossDown21)
+	http.HandleFunc("/webhook/ema/9-above-21", handleEMA9Above21)
+	http.HandleFunc("/webhook/ema/9-below-21", handleEMA9Below21)
 	http.HandleFunc("/webhook/ema/price-cross-down-50", handlePriceCrossDownEMA50)
 	http.HandleFunc("/webhook/ema/price-cross-up-50", handlePriceCrossUpEMA50)
 

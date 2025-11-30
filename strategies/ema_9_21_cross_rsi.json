@@ -1,6 +1,6 @@
 {
-  "name": "EMA Crossover + MACD + RSI Confirmation - Optimized (5min)",
-  "description": "Long: Price above EMA 50, EMA 9 crosses above 21, MACD histogram crosses up, RSI crosses above 50. Exit on RSI overbought, EMA cross reversal, or hard stop. Short: inverse.",
+  "name": "EMA 9/21 Cross + EMA 50 Filter + RSI Momentum (5min)",
+  "description": "Long: Price above EMA 50, EMA 9 crosses above 21, RSI above 50. Exit on RSI overbought (70), EMA cross reversal, or price below EMA 50. Short: inverse.",
   "long": {
     "entry": {
       "combination": "all",
@@ -13,12 +13,12 @@
         {
           "type": "condition",
           "webhook": "/webhook/ema/9-cross-up-21",
-          "comment": "EMA 9 crosses above EMA 21 - short-term momentum shift (primary trigger)"
+          "comment": "EMA 9 crosses above EMA 21 - bullish momentum trigger"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/rsi/cross-up-50",
-          "comment": "RSI crosses above 50 - final confirmation (must fire within 3 candles)"
+          "webhook": "/webhook/rsi/above-50",
+          "comment": "RSI above 50 - bullish momentum (persistent state)"
         }
       ]
     },
@@ -39,11 +39,6 @@
           "type": "condition",
           "webhook": "/webhook/ema/price-cross-down-50",
           "comment": "Price crosses below EMA 50 - hard stop loss, trend invalidated"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/macd/cross-down",
-          "comment": "MACD signal line crosses down - momentum fully reversed"
         }
       ]
     }
@@ -60,12 +55,12 @@
         {
           "type": "condition",
           "webhook": "/webhook/ema/9-cross-down-21",
-          "comment": "EMA 9 crosses below EMA 21 - short-term momentum shift (primary trigger)"
+          "comment": "EMA 9 crosses below EMA 21 - bearish momentum trigger"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/rsi/cross-down-50",
-          "comment": "RSI crosses below 50 - final confirmation (must fire within 3 candles)"
+          "webhook": "/webhook/rsi/below-50",
+          "comment": "RSI below 50 - bearish momentum (persistent state)"
         }
       ]
     },
@@ -86,11 +81,6 @@
           "type": "condition",
           "webhook": "/webhook/ema/price-cross-up-50",
           "comment": "Price crosses above EMA 50 - hard stop loss, trend invalidated"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/macd/cross-up",
-          "comment": "MACD signal line crosses up - momentum fully reversed"
         }
       ]
     }
