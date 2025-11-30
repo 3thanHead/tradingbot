@@ -1,6 +1,6 @@
 {
   "name": "MACD + EMA 9/21 + RSI (5min)",
-  "description": "Entry: MACD cross, EMA 9 cross 21, RSI above/below 50. Exit: MACD cross and Stochastic RSI cross 50.",
+  "description": "Entry: MACD cross, EMA 9 cross 21, RSI above/below 50. Exit: MACD cross and Stochastic RSI cross 20/80.",
   "long": {
     "entry": {
       "combination": "all",
