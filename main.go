@@ -98,6 +98,7 @@ type PositionState struct {
 	SimulatedEntry  string  // Entry time for simulated trade
 	SimulatedExit   string  // Exit time for simulated trade
 	SimulatedPrice  string  // Entry price for simulated trade
+	LatestPrice     string  // Latest price from webhook (for P/L calculation)
 	MACDCrossedUp   bool    // Tracks if MACD crossed up
 	MACDCrossedDown bool    // Tracks if MACD crossed down
 	SwingHigh       float64 // Latest swing high price level
@@ -219,6 +220,18 @@ func getPositionState(symbol string) *PositionState {
 	}
 
 	return state
+}
+
+// updateLatestPrice updates the latest price for a symbol from webhook data
+func updateLatestPrice(symbol string, price string) {
+	if price == "" {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if state, exists := positions[symbol]; exists {
+		state.LatestPrice = price
+	}
 }
 
 // ============================================================================
@@ -1260,6 +1273,7 @@ func handleMACDCrossUp(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 MACD Cross Up for %s", symbol)
@@ -1319,6 +1333,7 @@ func handleMACDCrossDown(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 MACD Cross Down for %s", symbol)
@@ -1381,6 +1396,7 @@ func handleStochasticOversold(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic K&D entered OVERSOLD for %s", symbol)
@@ -1442,6 +1458,7 @@ func handleStochasticOverbought(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic K&D entered OVERBOUGHT for %s", symbol)
@@ -1507,6 +1524,7 @@ func handleStochRSICrossUp20(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic RSI crossed UP above 20 for %s", symbol)
@@ -1568,6 +1586,7 @@ func handleStochRSICrossDown20(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic RSI crossed DOWN below 20 for %s", symbol)
@@ -1610,6 +1629,7 @@ func handleStochRSICrossUp50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic RSI crossed UP above 50 for %s", symbol)
@@ -1668,6 +1688,7 @@ func handleStochRSICrossDown50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic RSI crossed DOWN below 50 for %s", symbol)
@@ -1726,6 +1747,7 @@ func handleStochRSICrossUp80(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic RSI crossed UP above 80 for %s", symbol)
@@ -1768,6 +1790,7 @@ func handleStochRSICrossDown80(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Stochastic RSI crossed DOWN below 80 for %s", symbol)
@@ -1833,7 +1856,11 @@ func handleRSIAbove50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
+
+	// Update latest price for P/L calculation
+	updateLatestPrice(symbol, event.Close)
 
 	// Store exchange information
 	mu.Lock()
@@ -1883,6 +1910,7 @@ func handleRSIBelow50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed BELOW 50 (downtrend) for %s", symbol)
@@ -1937,6 +1965,7 @@ func handleRSICrossUpOversell25(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	log.Printf("🔄 [CONVERT] Normalized %s → %s", event.Ticker, symbol)
 	state := getPositionState(symbol)
 
@@ -1998,6 +2027,7 @@ func handleRSICrossOversell30(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed oversold at 30 for %s", symbol)
@@ -2051,6 +2081,7 @@ func handleRSICross40(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed 40 for %s", symbol)
@@ -2094,6 +2125,7 @@ func handleRSICrossCenter50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI MA crossed center at 50 for %s", symbol)
@@ -2138,6 +2170,7 @@ func handleRSICross60(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed 60 for %s", symbol)
@@ -2181,6 +2214,7 @@ func handleRSICrossOverbuy70(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed overbought at 70 for %s", symbol)
@@ -2234,6 +2268,7 @@ func handleRSICrossDownOverbuy75(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed DOWN from overbought at 75 for %s", symbol)
@@ -2294,6 +2329,7 @@ func handlePriceAboveEMA20(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed ABOVE EMA 20 for %s", symbol)
@@ -2334,6 +2370,7 @@ func handlePriceBelowEMA20(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed BELOW EMA 20 for %s", symbol)
@@ -2387,6 +2424,7 @@ func handlePriceAboveEMA50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed ABOVE EMA 50 for %s", symbol)
@@ -2427,6 +2465,7 @@ func handlePriceBelowEMA50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed BELOW EMA 50 for %s", symbol)
@@ -2467,6 +2506,7 @@ func handlePriceAboveEMA200(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed ABOVE EMA 200 for %s", symbol)
@@ -2507,6 +2547,7 @@ func handlePriceBelowEMA200(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed BELOW EMA 200 for %s", symbol)
@@ -2551,6 +2592,7 @@ func handlePriceAboveMA4(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed ABOVE MA#4 for %s", symbol)
@@ -2591,6 +2633,7 @@ func handlePriceBelowMA4(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed BELOW MA#4 for %s", symbol)
@@ -2631,7 +2674,11 @@ func handleMA1CrossUpMA2(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
+
+	// Update latest price for P/L calculation
+	updateLatestPrice(symbol, event.Close)
 
 	log.Printf("📊 MA#1 crossed UP through MA#2 for %s", symbol)
 
@@ -2683,7 +2730,11 @@ func handleMA1CrossDownMA2(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
+
+	// Update latest price for P/L calculation
+	updateLatestPrice(symbol, event.Close)
 
 	log.Printf("📊 MA#1 crossed DOWN through MA#2 for %s", symbol)
 
@@ -2739,6 +2790,7 @@ func handleMACDHistCrossUp0(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 MACD Histogram crossed UP through zero for %s", symbol)
@@ -2796,6 +2848,7 @@ func handleRSICrossDown40(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed DOWN through 40 for %s", symbol)
@@ -2847,6 +2900,7 @@ func handleRSICrossUp60(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed UP through 60 for %s", symbol)
@@ -2888,6 +2942,7 @@ func handleRSICrossDown60(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed DOWN through 60 for %s", symbol)
@@ -2934,6 +2989,7 @@ func handleRSICrossUp80(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed UP through 80 for %s (extreme overbought)", symbol)
@@ -2980,6 +3036,7 @@ func handleRSICrossDown80(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed DOWN through 80 for %s", symbol)
@@ -3015,6 +3072,7 @@ func handleRSICrossUp50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed UP through 50 for %s", symbol)
@@ -3059,6 +3117,7 @@ func handleRSICrossDown50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed DOWN through 50 for %s", symbol)
@@ -3103,6 +3162,7 @@ func handleRSICrossDown70(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed DOWN from 70 for %s", symbol)
@@ -3148,6 +3208,7 @@ func handleRSICrossUp30(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 RSI crossed UP from 30 for %s", symbol)
@@ -3193,6 +3254,7 @@ func handleMACDHistCrossDown0(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 MACD Histogram crossed DOWN through zero for %s", symbol)
@@ -3246,6 +3308,7 @@ func handleMACDHistAbove0(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 MACD Histogram is above zero for %s", symbol)
@@ -3296,6 +3359,7 @@ func handleMACDHistBelow0(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 MACD Histogram is below zero for %s", symbol)
@@ -3347,6 +3411,7 @@ func handleEMA9CrossUp21(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 EMA 9 crossed UP through EMA 21 for %s", symbol)
@@ -3400,6 +3465,7 @@ func handleEMA9CrossDown21(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 EMA 9 crossed DOWN through EMA 21 for %s", symbol)
@@ -3452,6 +3518,7 @@ func handleEMA9Above21(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 EMA 9 is above EMA 21 for %s", symbol)
@@ -3504,6 +3571,7 @@ func handleEMA9Below21(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 EMA 9 is below EMA 21 for %s", symbol)
@@ -3555,6 +3623,7 @@ func handlePriceCrossDownEMA50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed DOWN through EMA 50 for %s", symbol)
@@ -3603,6 +3672,7 @@ func handlePriceCrossUpEMA50(w http.ResponseWriter, r *http.Request) {
 	if !validateSymbol(w, symbol) {
 		return
 	}
+	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
 	log.Printf("📊 Price crossed UP through EMA 50 for %s", symbol)
@@ -4486,30 +4556,42 @@ func syncPositionsFromOanda() error {
 }
 
 func openLongPosition(symbol string, price string) {
-	// Check if any position is already open across all symbols
+	mu.Lock()
+	state := positions[symbol]
+	exchange := state.Exchange
+	mu.Unlock()
+
+	// Determine if this will be a simulated trade
+	isSimulated := exchange != "OANDA" && exchange != ""
+
+	// Check if any position is already open on the SAME exchange type
 	mu.RLock()
 	for sym, s := range positions {
 		if s.PositionOpen {
-			mu.RUnlock()
-			log.Println(strings.Repeat("🚫", 40))
-			log.Printf("🚫 [BLOCKED] Cannot open LONG on %s", symbol)
-			log.Printf("   Reason: Position already open on %s (%s)", sym, strings.ToUpper(s.Position))
-			log.Printf("   Action: Clearing entry conditions for %s to avoid false 'ready' state", symbol)
-			log.Println(strings.Repeat("🚫", 40))
+			// Only block if same exchange type (both OANDA or both simulated)
+			otherIsSimulated := s.Exchange != "OANDA" && s.Exchange != ""
+			if isSimulated == otherIsSimulated {
+				mu.RUnlock()
+				log.Println(strings.Repeat("🚫", 40))
+				log.Printf("🚫 [BLOCKED] Cannot open LONG on %s", symbol)
+				log.Printf("   Reason: Position already open on %s (%s)", sym, strings.ToUpper(s.Position))
+				log.Printf("   Action: Clearing entry conditions for %s to avoid false 'ready' state", symbol)
+				log.Println(strings.Repeat("🚫", 40))
 
-			// Clear entry conditions for this symbol since it can't open
-			mu.Lock()
-			blockedState := positions[symbol]
-			blockedState.EntryConditionsCompleted = make(map[string]bool)
-			mu.Unlock()
-			return
+				// Clear entry conditions for this symbol since it can't open
+				mu.Lock()
+				blockedState := positions[symbol]
+				blockedState.EntryConditionsCompleted = make(map[string]bool)
+				mu.Unlock()
+				return
+			}
 		}
 	}
 	mu.RUnlock()
 
 	mu.Lock()
-	state := positions[symbol]
-	exchange := state.Exchange
+	state = positions[symbol]
+	exchange = state.Exchange
 	mu.Unlock()
 
 	// Check if this is a non-OANDA exchange (simulated trade)
@@ -4618,33 +4700,43 @@ func openLongPosition(symbol string, price string) {
 }
 
 func openShortPosition(symbol string, price string) {
-	// Check if any position is already open across all symbols
-	mu.RLock()
-	for sym, s := range positions {
-		if s.PositionOpen {
-			mu.RUnlock()
-			log.Println(strings.Repeat("🚫", 40))
-			log.Printf("🚫 [BLOCKED] Cannot open SHORT on %s", symbol)
-			log.Printf("   Reason: Position already open on %s (%s)", sym, strings.ToUpper(s.Position))
-			log.Printf("   Action: Clearing entry conditions for %s to avoid false 'ready' state", symbol)
-			log.Println(strings.Repeat("🚫", 40))
-
-			// Clear entry conditions for this symbol since it can't open
-			mu.Lock()
-			blockedState := positions[symbol]
-			blockedState.EntryConditionsCompleted = make(map[string]bool)
-			mu.Unlock()
-			return
-		}
-	}
-	mu.RUnlock()
-
 	mu.Lock()
 	state := positions[symbol]
 	exchange := state.Exchange
 	mu.Unlock()
 
-	// Check if this is a non-OANDA exchange (simulated trade)
+	// Determine if this will be a simulated trade
+	isSimulated := exchange != "OANDA" && exchange != ""
+
+	// Check if any position is already open on the SAME exchange type
+	mu.RLock()
+	for sym, s := range positions {
+		if s.PositionOpen {
+			// Only block if same exchange type (both OANDA or both simulated)
+			otherIsSimulated := s.Exchange != "OANDA" && s.Exchange != ""
+			if isSimulated == otherIsSimulated {
+				mu.RUnlock()
+				log.Println(strings.Repeat("🚫", 40))
+				log.Printf("🚫 [BLOCKED] Cannot open SHORT on %s", symbol)
+				log.Printf("   Reason: Position already open on %s (%s)", sym, strings.ToUpper(s.Position))
+				log.Printf("   Action: Clearing entry conditions for %s to avoid false 'ready' state", symbol)
+				log.Println(strings.Repeat("🚫", 40))
+
+				// Clear entry conditions for this symbol since it can't open
+				mu.Lock()
+				blockedState := positions[symbol]
+				blockedState.EntryConditionsCompleted = make(map[string]bool)
+				mu.Unlock()
+				return
+			}
+		}
+	}
+	mu.RUnlock()
+
+	mu.Lock()
+	state = positions[symbol]
+	exchange = state.Exchange
+	mu.Unlock() // Check if this is a non-OANDA exchange (simulated trade)
 	if exchange != "OANDA" && exchange != "" {
 		// Calculate position size with 1:10 leverage for simulation
 		var positionSize float64
@@ -5081,6 +5173,33 @@ func reportStrategyStatus() {
 					strings.ToUpper(state.Position), state.Exchange, "")
 				log.Printf("  │ Entry: %s @ %s%-33s│",
 					state.SimulatedEntry, state.SimulatedPrice, "")
+
+				// Calculate and display P/L if we have latest price
+				if state.LatestPrice != "" && state.SimulatedPrice != "" {
+					entryPrice, err1 := strconv.ParseFloat(state.SimulatedPrice, 64)
+					currentPrice, err2 := strconv.ParseFloat(state.LatestPrice, 64)
+					if err1 == nil && err2 == nil {
+						var plDollars, plPercent float64
+						if state.Position == "long" {
+							plDollars = currentPrice - entryPrice
+							plPercent = (plDollars / entryPrice) * 100
+						} else {
+							plDollars = entryPrice - currentPrice
+							plPercent = (plDollars / entryPrice) * 100
+						}
+
+						plColor := "🟢"
+						plSign := "+"
+						if plDollars < 0 {
+							plColor = "🔴"
+							plSign = ""
+						}
+
+						log.Printf("  │ Current: %s (%s P/L: %s$%.5f / %s%.2f%%)%-15s│",
+							state.LatestPrice, plColor, plSign, plDollars, plSign, plPercent, "")
+					}
+				}
+
 				log.Printf("  │ Trade ID: %s%-48s│", state.TradeID, "")
 				log.Println("  └─────────────────────────────────────────────────────────────────────┘")
 			} else {
@@ -5089,9 +5208,7 @@ func reportStrategyStatus() {
 					strings.ToUpper(state.Position), state.TradeID, "")
 				log.Println("  └─────────────────────────────────────────────────────────────────────┘")
 			}
-			log.Println("")
-
-			// Show ONLY exit conditions for the current position
+			log.Println("") // Show ONLY exit conditions for the current position
 			if state.Position == "long" {
 				if activeStrategy.Long != nil {
 					reportExitConditions(symbol, "LONG", &activeStrategy.Long.Exit, "long_", state)

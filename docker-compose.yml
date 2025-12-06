@@ -18,7 +18,7 @@ services:
       - STOP_LOSS_PIPS=${STOP_LOSS_PIPS}
       - STOP_LOSS_DOLLARS=${STOP_LOSS_DOLLARS}
       - STOP_LOSS_PCT=${STOP_LOSS_PCT}
-      - STRATEGY=${STRATEGY:-default}
+      - STRATEGY_FILE=${STRATEGY_FILE:-default}
       - TIMEZONE_OFFSET=${TIMEZONE_OFFSET:-0}
     volumes:
       - ./strategies:/app/strategies:ro
