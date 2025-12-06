@@ -1,39 +1,34 @@
 {
-  "name": "MACD + EMA 9/21 + RSI (5min)",
-  "description": "Entry: MACD cross, EMA 9 cross 21, RSI above/below 50. Exit: MACD cross and Stochastic RSI cross 20/80.",
+  "name": "MA Ribbon + RSI 50 Strategy (15min)",
+  "description": "Entry: RSI 50 momentum + MA#1 crosses MA#2. Exit: Stochastic RSI crossing 50 OR MA#1 crosses back. Stop loss and take profit via OANDA orders.",
   "long": {
     "entry": {
       "combination": "all",
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/macd/cross-up",
-          "comment": "MACD bullish cross - momentum trigger"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/ema/9-cross-up-21",
-          "comment": "EMA 9 crosses above EMA 21 - short-term trend"
-        },
-        {
-          "type": "condition",
           "webhook": "/webhook/rsi/above-50",
           "comment": "RSI above 50 - bullish momentum"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/ma1-cross-up-ma2",
+          "comment": "MA#1 crosses above MA#2 - entry timing"
         }
       ]
     },
     "exit": {
-      "combination": "all",
+      "combination": "any",
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/macd/cross-down",
-          "comment": "MACD bearish cross - momentum reversal"
+          "webhook": "/webhook/stochastic-rsi/cross-down-50",
+          "comment": "Stochastic RSI crosses down 50 - momentum weakening, exit LONG"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/stochastic-rsi/cross-down-80",
-          "comment": "Stochastic RSI crosses below 80 - overbought exit"
+          "webhook": "/webhook/ma/ma1-cross-down-ma2",
+          "comment": "MA#1 crosses back below MA#2 - trend reversal exit"
         }
       ]
     }
@@ -44,33 +39,28 @@
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/macd/cross-down",
-          "comment": "MACD bearish cross - momentum trigger"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/ema/9-cross-down-21",
-          "comment": "EMA 9 crosses below EMA 21 - short-term trend"
-        },
-        {
-          "type": "condition",
           "webhook": "/webhook/rsi/below-50",
           "comment": "RSI below 50 - bearish momentum"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/ma1-cross-down-ma2",
+          "comment": "MA#1 crosses below MA#2 - entry timing"
         }
       ]
     },
     "exit": {
-      "combination": "all",
+      "combination": "any",
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/macd/cross-up",
-          "comment": "MACD bullish cross - momentum reversal"
+          "webhook": "/webhook/stochastic-rsi/cross-up-50",
+          "comment": "Stochastic RSI crosses up 50 - momentum weakening, exit SHORT"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/stochastic-rsi/cross-up-20",
-          "comment": "Stochastic RSI crosses above 20 - oversold exit"
+          "webhook": "/webhook/ma/ma1-cross-up-ma2",
+          "comment": "MA#1 crosses back above MA#2 - trend reversal exit"
         }
       ]
     }
