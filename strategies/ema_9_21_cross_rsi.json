@@ -1,6 +1,6 @@
 {
-  "name": "MA Ribbon + RSI 50 Strategy (15min)",
-  "description": "Entry: RSI 50 momentum + MA#1 crosses MA#2. Exit: Stochastic RSI crossing 50 OR MA#1 crosses back. Stop loss and take profit via OANDA orders.",
+  "name": "MA Ribbon + RSI 50 Strategy (15min) - Internal Cross Detection",
+  "description": "Entry: RSI 50 momentum + MA#1 crosses MA#2 (detected internally) + 200 EMA trend filter. Exit: Stochastic RSI overbought/oversold. Uses position tracking webhooks for maximum reliability.",
   "long": {
     "entry": {
       "combination": "all",
@@ -12,8 +12,13 @@
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ma/ma1-cross-up-ma2",
-          "comment": "MA#1 crosses above MA#2 - entry timing"
+          "webhook": "/webhook/ma/ma1-above-ma2",
+          "comment": "MA#1 above MA#2 - cross detected internally for reliability"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-above-ma4",
+          "comment": "Price above 200 EMA - trade with major trend"
         }
       ]
     },
@@ -22,13 +27,8 @@
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/stochastic-rsi/cross-down-50",
-          "comment": "Stochastic RSI crosses down 50 - momentum weakening, exit LONG"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/ma/ma1-cross-down-ma2",
-          "comment": "MA#1 crosses back below MA#2 - trend reversal exit"
+          "webhook": "/webhook/stochastic-rsi/overbought",
+          "comment": "Stochastic RSI overbought - take profit on LONG"
         }
       ]
     }
@@ -44,8 +44,13 @@
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ma/ma1-cross-down-ma2",
-          "comment": "MA#1 crosses below MA#2 - entry timing"
+          "webhook": "/webhook/ma/ma1-below-ma2",
+          "comment": "MA#1 below MA#2 - cross detected internally for reliability"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-below-ma4",
+          "comment": "Price below 200 EMA - trade with major trend"
         }
       ]
     },
@@ -54,13 +59,8 @@
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/stochastic-rsi/cross-up-50",
-          "comment": "Stochastic RSI crosses up 50 - momentum weakening, exit SHORT"
-        },
-        {
-          "type": "condition",
-          "webhook": "/webhook/ma/ma1-cross-up-ma2",
-          "comment": "MA#1 crosses back above MA#2 - trend reversal exit"
+          "webhook": "/webhook/stochastic-rsi/oversold",
+          "comment": "Stochastic RSI oversold - take profit on SHORT"
         }
       ]
     }
