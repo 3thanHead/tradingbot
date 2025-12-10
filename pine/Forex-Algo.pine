@@ -1,0 +1,143 @@
+//@version=6
+strategy("Forex Algo - EMA/RSI/MACD", shorttitle="Forex Algo", overlay=true, 
+         default_qty_type=strategy.percent_of_equity, default_qty_value=2,
+         commission_type=strategy.commission.cash_per_order, commission_value=0.0001,
+         slippage=2)
+
+//========================
+// INPUTS
+//========================
+// EMAs for Trend Filter
+ema_fast_len = input.int(21, "Fast EMA (Trend)", minval=1, group="EMA Settings")
+ema_slow_len = input.int(55, "Slow EMA (Trend)", minval=1, group="EMA Settings")
+
+// RSI for Entry Timing
+rsi_length = input.int(14, "RSI Length", minval=1, group="RSI Settings")
+rsi_overbought = input.int(65, "RSI Overbought", minval=50, maxval=90, group="RSI Settings")
+rsi_oversold = input.int(35, "RSI Oversold", minval=10, maxval=50, group="RSI Settings")
+
+// MACD for Momentum Confirmation
+macd_fast = input.int(12, "MACD Fast", minval=1, group="MACD Settings")
+macd_slow = input.int(26, "MACD Slow", minval=1, group="MACD Settings")
+macd_signal = input.int(9, "MACD Signal", minval=1, group="MACD Settings")
+
+// Risk Management
+use_stop_loss = input.bool(true, "Use Stop Loss", group="Risk Management")
+stop_loss_atr = input.float(1.5, "Stop Loss (x ATR)", minval=0.5, step=0.5, group="Risk Management")
+use_take_profit = input.bool(true, "Use Take Profit", group="Risk Management")
+take_profit_atr = input.float(3.0, "Take Profit (x ATR)", minval=1.0, step=0.5, group="Risk Management")
+atr_length = input.int(14, "ATR Length", minval=1, group="Risk Management")
+
+// Alerts
+alert_long_entry = input.string("LONG_ENTRY", "Long Entry Message", group="Alerts")
+alert_short_entry = input.string("SHORT_ENTRY", "Short Entry Message", group="Alerts")
+alert_long_exit = input.string("LONG_EXIT", "Long Exit Message", group="Alerts")
+alert_short_exit = input.string("SHORT_EXIT", "Short Exit Message", group="Alerts")
+
+//========================
+// CALCULATE INDICATORS
+//========================
+// EMAs
+ema_fast = ta.ema(close, ema_fast_len)
+ema_slow = ta.ema(close, ema_slow_len)
+
+// RSI
+rsi = ta.rsi(close, rsi_length)
+
+// MACD
+[macd_line, signal_line, hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// ATR for stops
+atr = ta.atr(atr_length)
+
+//========================
+// TREND DETERMINATION
+//========================
+bullish_trend = ema_fast > ema_slow and close > ema_fast
+bearish_trend = ema_fast < ema_slow and close < ema_fast
+
+//========================
+// ENTRY CONDITIONS
+//========================
+// LONG: Bullish trend + RSI oversold bounce + MACD bullish cross
+rsi_bounce_long = ta.crossover(rsi, rsi_oversold) or (rsi > rsi_oversold and rsi < 50)
+macd_bullish = ta.crossover(macd_line, signal_line) or (macd_line > signal_line and hist > hist[1])
+
+long_entry = bullish_trend and rsi_bounce_long and macd_bullish
+
+// SHORT: Bearish trend + RSI overbought rejection + MACD bearish cross
+rsi_rejection_short = ta.crossunder(rsi, rsi_overbought) or (rsi < rsi_overbought and rsi > 50)
+macd_bearish = ta.crossunder(macd_line, signal_line) or (macd_line < signal_line and hist < hist[1])
+
+short_entry = bearish_trend and rsi_rejection_short and macd_bearish
+
+//========================
+// EXIT CONDITIONS
+//========================
+// Exit when MACD crosses back or RSI hits opposite extreme
+long_exit = ta.crossunder(macd_line, signal_line) or rsi > rsi_overbought
+short_exit = ta.crossover(macd_line, signal_line) or rsi < rsi_oversold
+
+//========================
+// POSITION SIZING & STOPS
+//========================
+var float long_stop = na
+var float long_take = na
+var float short_stop = na
+var float short_take = na
+
+if long_entry
+    long_stop := use_stop_loss ? close - (atr * stop_loss_atr) : na
+    long_take := use_take_profit ? close + (atr * take_profit_atr) : na
+
+if short_entry
+    short_stop := use_stop_loss ? close + (atr * stop_loss_atr) : na
+    short_take := use_take_profit ? close - (atr * take_profit_atr) : na
+
+//========================
+// EXECUTE TRADES
+//========================
+if long_entry
+    strategy.entry("Long", strategy.long)
+    if use_stop_loss
+        strategy.exit("Long Exit", "Long", stop=long_stop, limit=long_take)
+
+if short_entry
+    strategy.entry("Short", strategy.short)
+    if use_stop_loss
+        strategy.exit("Short Exit", "Short", stop=short_stop, limit=short_take)
+
+// Manual exits
+if long_exit and strategy.position_size > 0
+    strategy.close("Long")
+
+if short_exit and strategy.position_size < 0
+    strategy.close("Short")
+
+//========================
+// ALERTS
+//========================
+alertcondition(long_entry, "Long Entry", "{{alert_long_entry}}")
+alertcondition(short_entry, "Short Entry", "{{alert_short_entry}}")
+alertcondition(long_exit, "Long Exit", "{{alert_long_exit}}")
+alertcondition(short_exit, "Short Exit", "{{alert_short_exit}}")
+
+//========================
+// PLOT
+//========================
+plot(ema_fast, "EMA Fast", color.blue, 2)
+plot(ema_slow, "EMA Slow", color.orange, 2)
+
+// Background for trend
+bgcolor(bullish_trend ? color.new(color.green, 95) : bearish_trend ? color.new(color.red, 95) : na)
+
+// Plot stops for visual confirmation
+plot(strategy.position_size > 0 ? long_stop : na, "Long Stop", color.red, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? long_take : na, "Long Target", color.green, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? short_stop : na, "Short Stop", color.red, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? short_take : na, "Short Target", color.green, style=plot.style_linebr)
+
+// Entry markers
+plotshape(long_entry, "Long", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(short_entry, "Short", shape.triangledown, location.abovebar, color.red, size=size.small)
+```

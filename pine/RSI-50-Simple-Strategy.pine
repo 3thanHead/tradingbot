@@ -1,0 +1,78 @@
+//@version=5
+strategy("RSI 50 Simple Strategy", shorttitle="RSI 50", overlay=true,
+         initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.1,
+         slippage=2)
+
+//========================
+// Inputs
+//========================
+rsi_length = input.int(14, "RSI Length", minval=1)
+rsi_extreme_high = input.int(70, "RSI Extreme High", minval=60, maxval=90)
+rsi_extreme_low = input.int(30, "RSI Extreme Low", minval=10, maxval=40)
+
+use_stop_loss = input.bool(true, "Use Stop Loss")
+stop_loss_percent = input.float(2.0, "Stop Loss %", minval=0.1, step=0.1)
+
+//========================
+// Calculate RSI
+//========================
+rsi = ta.rsi(close, rsi_length)
+
+//========================
+// Entry/Exit Conditions
+//========================
+// Long: RSI crosses above 50
+long_entry = ta.crossover(rsi, 50)
+
+// Long exit: RSI reaches 70
+long_exit = rsi >= rsi_extreme_high
+
+// Short: RSI crosses below 50
+short_entry = ta.crossunder(rsi, 50)
+
+// Short exit: RSI reaches 30
+short_exit = rsi <= rsi_extreme_low
+
+//========================
+// Execute Trades
+//========================
+if long_entry and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    if use_stop_loss
+        strategy.exit("Long SL", "Long", stop=close * (1 - stop_loss_percent / 100))
+
+if long_exit and strategy.position_size > 0
+    strategy.close("Long")
+
+if short_entry and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    if use_stop_loss
+        strategy.exit("Short SL", "Short", stop=close * (1 + stop_loss_percent / 100))
+
+if short_exit and strategy.position_size < 0
+    strategy.close("Short")
+
+//========================
+// Alerts
+//========================
+buySignal = strategy.position_size > 0 and strategy.position_size[1] == 0
+sellSignal = strategy.position_size < 0 and strategy.position_size[1] == 0
+
+alertcondition(buySignal, "Long Entry", "LONG_ENTRY")
+alertcondition(sellSignal, "Short Entry", "SHORT_ENTRY")
+alertcondition(long_exit, "Long Exit", "LONG_EXIT")
+alertcondition(short_exit, "Short Exit", "SHORT_EXIT")
+
+//========================
+// Plotting
+//========================
+plot(rsi, "RSI", color.blue, linewidth=2)
+hline(rsi_extreme_high, "High", color.red, linestyle=hline.style_dashed)
+hline(50, "Midline", color.gray, linestyle=hline.style_solid)
+hline(rsi_extreme_low, "Low", color.green, linestyle=hline.style_dashed)
+
+bgcolor(rsi >= rsi_extreme_high ? color.new(color.red, 90) : rsi <= rsi_extreme_low ? color.new(color.green, 90) : na)
+
+plotshape(buySignal, "Buy", shape.triangleup, location.belowbar, color.green, size=size.normal)
+plotshape(sellSignal, "Sell", shape.triangledown, location.abovebar, color.red, size=size.normal)

@@ -1,0 +1,314 @@
+//@version=5
+indicator("CRR - Smart Money Concept ES (Pro Expo)", overlay=true, max_labels_count=500, max_lines_count=500)
+
+//========================
+// Main Inputs
+//========================
+sens        = input.int(10, "Structure Period (left lookback)", minval=1, maxval=50)
+sensRight   = input.int(2,  "Confirmation bars (right lookback)", minval=1, maxval=20)
+showHHLL    = input.bool(true,  "Show HH / LH / HL / LL")
+showBMS     = input.bool(true,  "Show BMS / ChoCH")
+showDots    = input.bool(true,  "Show swing points")
+showRange   = input.bool(true,  "Show current range (yellow dotted line)")
+
+//========================
+// Confirmation Filters
+//========================
+useFilters  = input.bool(true,  "Filter breaks with ATR / Volume / MACD / Gap")
+atrLen      = input.int(14,      "ATR Length", minval=1)
+atrMult     = input.float(0.30,  "Minimum close vs structure (x ATR)", minval=0.0, step=0.05)
+volLen      = input.int(20,      "Volume MA Length", minval=1)
+volMult     = input.float(1.5,   "Minimum volume (x average)", minval=0.1, step=0.1)
+gapMult     = input.float(1.0,   "Gap (x ATR) to mark possible fake", minval=0.0, step=0.1)
+
+//========================
+// Internal Fibo
+//========================
+useFib    = input.bool(true,   "Show internal Fibo of last range")
+fib382Col = color.new(color.rgb(0,189,189), 70)
+fib618Col = color.new(color.rgb(0,189,189), 70)
+fib50Col  = color.new(color.gray, 80)
+
+//========================
+// Alert Messages
+//========================
+alert_hh_msg = input.string("HH", "Higher High Alert Message", group="Alerts")
+alert_lh_msg = input.string("LH", "Lower High Alert Message", group="Alerts")
+alert_hl_msg = input.string("HL", "Higher Low Alert Message", group="Alerts")
+alert_ll_msg = input.string("LL", "Lower Low Alert Message", group="Alerts")
+
+//========================
+// Colors Expo style
+//========================
+colStructLine = color.rgb(0, 189, 189)        // Turquoise SMC
+colSwingDotHi = color.new(color.red, 0)       // High point
+colSwingDotLo = color.new(color.lime, 0)      // Low point
+
+txtHHLL = color.white
+bgHHLL  = color.new(color.black, 60)
+
+txtBMSStrong = colStructLine
+txtBMSWeak   = color.new(color.gray, 0)
+bgBMS        = color.new(color.black, 60)
+
+txtChoStrong = colStructLine
+txtChoWeak   = color.new(color.orange, 0)
+bgCho        = color.new(color.black, 60)
+
+// Yellow range
+colRange     = color.new(color.yellow, 0)
+
+// Visual offset for structure text
+offset = syminfo.mintick * 15.0
+
+//========================
+// Structure variables
+//========================
+var float swingHigh      = na
+var int   swingHighIndex = na
+var float swingLow       = na
+var int   swingLowIndex  = na
+
+var float lastBrokenHigh = na
+var float lastBrokenLow  = na
+
+var int   trend          = 0   // 1 bullish, -1 bearish, 0 neutral
+
+// Persistent Fibo lines
+var line fib382 = na
+var line fib50  = na
+var line fib618 = na
+
+// Yellow range lines
+var line rangeHighLine = na
+var line rangeLowLine  = na
+
+//========================
+// Variables for alerts
+//========================
+var bool alertHH = false
+var bool alertLH = false
+var bool alertHL = false
+var bool alertLL = false
+
+//========================
+// Indicators for filters
+//========================
+atr   = ta.atr(atrLen)
+volMa = ta.sma(volume, volLen)
+macd  = ta.ema(close, 12) - ta.ema(close, 26)
+macdS = ta.ema(macd, 9)
+
+// Gaps
+gapUp   = gapMult > 0 and (open - close[1]) > atr * gapMult
+gapDown = gapMult > 0 and (close[1] - open) > atr * gapMult
+
+//========================
+// Base pivots
+//========================
+ph = ta.pivothigh(high, sens, sensRight)
+pl = ta.pivotlow(low,  sens, sensRight)
+
+//========================
+// Reset alert flags each bar
+//========================
+alertHH := false
+alertLH := false
+alertHL := false
+alertLL := false
+
+//========================
+// Swing Highs: HH / LH + point
+//========================
+if not na(ph)
+    ix   = bar_index - sensRight
+    isHH = not na(swingHigh) and ph > swingHigh
+    isLH = not na(swingHigh) and ph < swingHigh
+
+    swingHigh      := ph
+    swingHighIndex := ix
+
+    // Smaller high point
+    if showDots
+        label.new(ix, ph, "",
+                  xloc.bar_index, yloc.price,
+                  colSwingDotHi, label.style_circle, colSwingDotHi, size.tiny)
+
+    // Separate and large HH / LH
+    if showHHLL
+        yy = ph + offset
+        if isHH
+            label.new(ix, yy, "HH",
+                      xloc.bar_index, yloc.price,
+                      bgHHLL, label.style_label_down, txtHHLL, size.normal)
+            alertHH := true
+        else if isLH
+            label.new(ix, yy, "LH",
+                      xloc.bar_index, yloc.price,
+                      bgHHLL, label.style_label_down, txtHHLL, size.normal)
+            alertLH := true
+
+//========================
+// Swing Lows: HL / LL + point
+//========================
+if not na(pl)
+    ix   = bar_index - sensRight
+    isHL = not na(swingLow) and pl > swingLow
+    isLL = not na(swingLow) and pl < swingLow
+
+    swingLow      := pl
+    swingLowIndex := ix
+
+    // Smaller low point
+    if showDots
+        label.new(ix, pl, "",
+                  xloc.bar_index, yloc.price,
+                  colSwingDotLo, label.style_circle, colSwingDotLo, size.tiny)
+
+    // Separate and large HL / LL
+    if showHHLL
+        yy = pl - offset
+        if isHL
+            label.new(ix, yy, "HL",
+                      xloc.bar_index, yloc.price,
+                      bgHHLL, label.style_label_up, txtHHLL, size.normal)
+            alertHL := true
+        else if isLL
+            label.new(ix, yy, "LL",
+                      xloc.bar_index, yloc.price,
+                      bgHHLL, label.style_label_up, txtHHLL, size.normal)
+            alertLL := true
+
+//========================
+// Alert Conditions
+//========================
+alertcondition(alertHH, title="Higher High (HH)", message="{{alert_hh_msg}}")
+alertcondition(alertLH, title="Lower High (LH)", message="{{alert_lh_msg}}")
+alertcondition(alertHL, title="Higher Low (HL)", message="{{alert_hl_msg}}")
+alertcondition(alertLL, title="Lower Low (LL)", message="{{alert_ll_msg}}")
+
+//========================
+// Helper functions: confirmations
+//========================
+bullStrongBreak(level) =>
+    condAtr = close > level + atrMult * atr
+    condVol = volume > volMa * volMult
+    condMac = macd > macdS
+    condGap = not gapUp
+    (not useFilters) or (condAtr and condVol and condMac and condGap)
+
+bearStrongBreak(level) =>
+    condAtr = close < level - atrMult * atr
+    condVol = volume > volMa * volMult
+    condMac = macd < macdS
+    condGap = not gapDown
+    (not useFilters) or (condAtr and condVol and condMac and condGap)
+
+//========================
+// Structure breaks
+//========================
+bosUp   = not na(swingHigh) and not na(swingHighIndex) and close > swingHigh and (na(lastBrokenHigh) or swingHigh != lastBrokenHigh)
+bosDown = not na(swingLow)  and not na(swingLowIndex)  and close < swingLow  and (na(lastBrokenLow)  or swingLow  != lastBrokenLow)
+
+//========================
+// BMS / ChoCH Bullish
+//========================
+if bosUp
+    lastBrokenHigh := swingHigh
+
+    line.new(swingHighIndex, swingHigh, bar_index, swingHigh,
+             xloc.bar_index, extend.none, colStructLine, line.style_solid, 1)
+
+    midX   = math.round((swingHighIndex + bar_index) / 2.0)
+    strong = bullStrongBreak(swingHigh)
+
+    if trend == -1 and showBMS
+        label.new(swingHighIndex, swingHigh, "ChoCH",
+                  xloc.bar_index, yloc.price,
+                  bgCho, label.style_label_left,
+                  strong ? txtChoStrong : txtChoWeak,
+                  size.normal)
+
+    if showBMS
+        label.new(midX, swingHigh, "BMS",
+                  xloc.bar_index, yloc.price,
+                  bgBMS, label.style_label_center,
+                  strong ? txtBMSStrong : txtBMSWeak,
+                  size.normal)
+
+    trend := 1
+
+//========================
+// BMS / ChoCH Bearish
+//========================
+if bosDown
+    lastBrokenLow := swingLow
+
+    line.new(swingLowIndex, swingLow, bar_index, swingLow,
+             xloc.bar_index, extend.none, colStructLine, line.style_solid, 1)
+
+    midX   = math.round((swingLowIndex + bar_index) / 2.0)
+    strong = bearStrongBreak(swingLow)
+
+    if trend == 1 and showBMS
+        label.new(swingLowIndex, swingLow, "ChoCH",
+                  xloc.bar_index, yloc.price,
+                  bgCho, label.style_label_left,
+                  strong ? txtChoStrong : txtChoWeak,
+                  size.normal)
+
+    if showBMS
+        label.new(midX, swingLow, "BMS",
+                  xloc.bar_index, yloc.price,
+                  bgBMS, label.style_label_center,
+                  strong ? txtBMSStrong : txtBMSWeak,
+                  size.normal)
+
+    trend := -1
+
+//========================
+// Internal Fibo of last range
+//========================
+if useFib and not na(swingHigh) and not na(swingLow) and swingHigh != swingLow
+    if not na(fib382)
+        line.delete(fib382)
+    if not na(fib50)
+        line.delete(fib50)
+    if not na(fib618)
+        line.delete(fib618)
+
+    float top    = math.max(swingHigh, swingLow)
+    float bottom = math.min(swingHigh, swingLow)
+    float range  = top - bottom
+
+    float lv382 = top - range * 0.382
+    float lv50  = top - range * 0.5
+    float lv618 = top - range * 0.618
+
+    int fromIndex = swingHighIndex < swingLowIndex ? swingHighIndex : swingLowIndex
+
+    fib382 := line.new(fromIndex, lv382, bar_index, lv382,
+                       xloc.bar_index, extend.none, fib382Col, line.style_solid, 1)
+    fib50  := line.new(fromIndex, lv50,  bar_index, lv50,
+                       xloc.bar_index, extend.none, fib50Col,  line.style_solid, 1)
+    fib618 := line.new(fromIndex, lv618, bar_index, lv618,
+                       xloc.bar_index, extend.none, fib618Col, line.style_solid, 1)
+
+//========================
+// Current range: yellow dotted lines
+//========================
+if showRange and not na(swingHigh) and not na(swingLow)
+    if not na(rangeHighLine)
+        line.delete(rangeHighLine)
+    if not na(rangeLowLine)
+        line.delete(rangeLowLine)
+
+    int fromIdx = swingHighIndex < swingLowIndex ? swingHighIndex : swingLowIndex
+
+    rangeHighLine := line.new(fromIdx, swingHigh, bar_index, swingHigh,
+                              xloc.bar_index, extend.none,
+                              colRange, line.style_dotted, 1)
+
+    rangeLowLine  := line.new(fromIdx, swingLow, bar_index, swingLow,
+                              xloc.bar_index, extend.none,
+                              colRange, line.style_dotted, 1)

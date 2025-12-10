@@ -1,0 +1,98 @@
+{
+  "name": "MA Trend + RSI 50 + MACD Strategy",
+  "description": "Long entry requires ALL: Price above MA2/MA4, RSI crosses up 50, MACD crosses up. Exit on ANY: RSI crosses down 70 or Price crosses down MA2. Short is opposite.",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/ma1-cross-up-ma2",
+          "comment": "MA1 crosses above MA2"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-above-ma2",
+          "comment": "Price above MA2 (21 EMA)"
+        },
+        {
+          "type": "required_but_not_trigger",
+          "webhook": "/webhook/ma/price-cross-up-ma4",
+          "comment": "Price crosses up MA4 - required but cannot be the final condition to trigger entry"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-up-50",
+          "comment": "RSI crosses up 50"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/macd/cross-up",
+          "comment": "MACD crosses above signal line"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-down-overbuy",
+          "comment": "RSI crosses down from overbought"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-cross-down-ma2",
+          "comment": "Price crosses down MA2"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/ma1-cross-down-ma2",
+          "comment": "MA1 crosses below MA2"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-below-ma2",
+          "comment": "Price below MA2 (21 EMA)"
+        },
+        {
+          "type": "required_but_not_trigger",
+          "webhook": "/webhook/ma/price-cross-down-ma4",
+          "comment": "Price crosses down MA4 - required but cannot be the final condition to trigger entry"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-down-50",
+          "comment": "RSI crosses down 50"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/macd/cross-down",
+          "comment": "MACD crosses below signal line"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/rsi/cross-up-oversell",
+          "comment": "RSI crosses up from oversold"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-cross-up-ma2",
+          "comment": "Price crosses up MA2"
+        }
+      ]
+    }
+  }
+}

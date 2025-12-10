@@ -1,0 +1,103 @@
+//@version=5
+strategy("EMA Ribbon + RSI Extremes", shorttitle="EMA RSI Strategy", overlay=true,
+         initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.1,
+         slippage=2)
+
+//========================
+// Inputs
+//========================
+ema1Len = input.int(9, "EMA 1 Length", minval=1, group="Moving Averages")
+ema2Len = input.int(21, "EMA 2 Length", minval=1, group="Moving Averages")
+ema3Len = input.int(50, "EMA 3 Length", minval=1, group="Moving Averages")
+
+rsi_length = input.int(14, "RSI Length", minval=1, group="RSI")
+rsi_overbought = input.int(70, "RSI Overbought", minval=50, maxval=90, group="RSI")
+rsi_oversold = input.int(30, "RSI Oversold", minval=10, maxval=50, group="RSI")
+
+macdFast = input.int(12, "MACD Fast", minval=1, group="MACD")
+macdSlow = input.int(26, "MACD Slow", minval=1, group="MACD")
+macdSignal = input.int(9, "MACD Signal", minval=1, group="MACD")
+
+use_stop_loss = input.bool(true, "Use Stop Loss", group="Risk Management")
+stop_loss_percent = input.float(1.5, "Stop Loss %", minval=0.1, step=0.1, group="Risk Management")
+
+tradeDirection = input.string("Both", "Trade Direction", options=["Long Only", "Short Only", "Both"])
+
+//========================
+// Calculate Indicators
+//========================
+ema1 = ta.ema(close, ema1Len)
+ema2 = ta.ema(close, ema2Len)
+ema3 = ta.ema(close, ema3Len)
+rsi = ta.rsi(close, rsi_length)
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+//========================
+// Entry/Exit Conditions
+//========================
+// Short Entry (ALL conditions required)
+short_entry_rsi = ta.crossunder(rsi, rsi_overbought)
+short_entry_ema = ema1 < ema2 and ema2 < ema3
+short_entry = short_entry_rsi and short_entry_ema and (tradeDirection == "Short Only" or tradeDirection == "Both")
+
+// Short Exit (ANY condition)
+short_exit_macd = ta.crossunder(macdLine, signalLine)
+short_exit_rsi = ta.crossunder(rsi, rsi_oversold)
+short_exit = (short_exit_macd or short_exit_rsi)
+
+// Long Entry (ALL conditions required)
+long_entry_rsi = ta.crossover(rsi, rsi_oversold)
+long_entry_ema = ema1 > ema2 and ema2 > ema3
+long_entry = long_entry_rsi and long_entry_ema and (tradeDirection == "Long Only" or tradeDirection == "Both")
+
+// Long Exit (ANY condition)
+long_exit_macd = ta.crossover(macdLine, signalLine)
+long_exit_rsi = ta.crossover(rsi, rsi_overbought)
+long_exit = (long_exit_macd or long_exit_rsi)
+
+//========================
+// Execute Trades
+//========================
+if long_entry and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    if use_stop_loss
+        stop_price = close * (1 - stop_loss_percent / 100)
+        strategy.exit("Long Exit", "Long", stop=stop_price)
+
+if short_entry and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    if use_stop_loss
+        stop_price = close * (1 + stop_loss_percent / 100)
+        strategy.exit("Short Exit", "Short", stop=stop_price)
+
+if long_exit and strategy.position_size > 0
+    strategy.close("Long")
+
+if short_exit and strategy.position_size < 0
+    strategy.close("Short")
+
+//========================
+// Alert Detection
+//========================
+buySignal = strategy.position_size > 0 and strategy.position_size[1] == 0
+sellSignal = strategy.position_size < 0 and strategy.position_size[1] == 0
+buyExit = strategy.position_size == 0 and strategy.position_size[1] > 0
+sellExit = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+alertcondition(buySignal, "Long Entry", "LONG_ENTRY")
+alertcondition(sellSignal, "Short Entry", "SHORT_ENTRY")
+alertcondition(buyExit, "Long Exit", "LONG_EXIT")
+alertcondition(sellExit, "Short Exit", "SHORT_EXIT")
+
+//========================
+// Plotting
+//========================
+plot(ema1, "EMA 1 (9)", color.aqua, linewidth=2)
+plot(ema2, "EMA 2 (21)", color.orange, linewidth=2)
+plot(ema3, "EMA 3 (50)", color.purple, linewidth=2)
+
+bgcolor(rsi > rsi_overbought ? color.new(color.red, 90) : rsi < rsi_oversold ? color.new(color.green, 90) : na)
+
+plotshape(buySignal, "Buy", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(sellSignal, "Sell", shape.triangledown, location.abovebar, color.red, size=size.small)

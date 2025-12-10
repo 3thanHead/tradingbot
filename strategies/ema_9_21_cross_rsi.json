@@ -1,6 +1,6 @@
 {
-  "name": "MA Ribbon + RSI 50 Strategy (15min) - Internal Cross Detection",
-  "description": "Entry: RSI 50 momentum + MA#1 crosses MA#2 (detected internally) + 200 EMA trend filter. Exit: Stochastic RSI overbought/oversold. Uses position tracking webhooks for maximum reliability.",
+  "name": "MA Ribbon (MA1>MA2>MA3) + RSI 50 Strategy",
+  "description": "Entry: MA ribbon alignment (MA1>MA2>MA3) + RSI above 50. Exit: MA1 crosses down MA2. Uses 3-MA ribbon with RSI filter.",
   "long": {
     "entry": {
       "combination": "all",
@@ -13,12 +13,12 @@
         {
           "type": "condition",
           "webhook": "/webhook/ma/ma1-above-ma2",
-          "comment": "MA#1 above MA#2 - cross detected internally for reliability"
+          "comment": "MA1 (low/fast) above MA2 (mid) - uptrend confirmation"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ma/price-above-ma4",
-          "comment": "Price above 200 EMA - trade with major trend"
+          "webhook": "/webhook/ma/ma2-above-ma3",
+          "comment": "MA2 (mid) above MA3 (high/slow) - ribbon alignment"
         }
       ]
     },
@@ -27,8 +27,8 @@
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/stochastic-rsi/overbought",
-          "comment": "Stochastic RSI overbought - take profit on LONG"
+          "webhook": "/webhook/ma/ma1-cross-down-ma2",
+          "comment": "MA1 crosses down MA2 - exit signal"
         }
       ]
     }
@@ -45,12 +45,12 @@
         {
           "type": "condition",
           "webhook": "/webhook/ma/ma1-below-ma2",
-          "comment": "MA#1 below MA#2 - cross detected internally for reliability"
+          "comment": "MA1 (low/fast) below MA2 (mid) - downtrend confirmation"
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ma/price-below-ma4",
-          "comment": "Price below 200 EMA - trade with major trend"
+          "webhook": "/webhook/ma/ma2-below-ma3",
+          "comment": "MA2 (mid) below MA3 (high/slow) - ribbon alignment"
         }
       ]
     },
@@ -59,8 +59,8 @@
       "conditions": [
         {
           "type": "condition",
-          "webhook": "/webhook/stochastic-rsi/oversold",
-          "comment": "Stochastic RSI oversold - take profit on SHORT"
+          "webhook": "/webhook/ma/ma1-cross-up-ma2",
+          "comment": "MA1 crosses up MA2 - exit signal"
         }
       ]
     }

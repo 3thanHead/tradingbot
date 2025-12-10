@@ -1,0 +1,94 @@
+//@version=5
+strategy("RSI 25/60 Strategy", overlay=true,
+         initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.1)
+
+//========================
+// Inputs
+//========================
+rsiLength = input.int(14, "RSI Length", minval=1)
+longEntry = input.int(25, "Long Entry Level", minval=0, maxval=100)
+shortEntry = input.int(75, "Short Entry Level", minval=0, maxval=100)
+
+macdFast = input.int(12, "MACD Fast Length", minval=1, group="MACD")
+macdSlow = input.int(26, "MACD Slow Length", minval=1, group="MACD")
+macdSignal = input.int(9, "MACD Signal Length", minval=1, group="MACD")
+
+useSL = input.bool(false, "Use Stop Loss", group="Risk Management")
+slPct = input.float(2.0, "Stop Loss %", minval=0.1, step=0.1, group="Risk Management")
+useTP = input.bool(false, "Use Take Profit", group="Risk Management")
+tpPct = input.float(4.0, "Take Profit %", minval=0.1, step=0.1, group="Risk Management")
+
+tradeDirection = input.string("Both", "Trade Direction", options=["Long Only", "Short Only", "Both"])
+
+//========================
+// Calculate RSI
+//========================
+rsi = ta.rsi(close, rsiLength)
+
+//========================
+// Calculate MACD
+//========================
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+
+//========================
+// Entry/Exit Conditions
+//========================
+// Long: RSI crosses up from 25
+longSignal = ta.crossover(rsi, longEntry) and (tradeDirection == "Long Only" or tradeDirection == "Both")
+
+// Long exit: MACD crosses below signal line (bearish cross)
+longExitSignal = ta.crossunder(macdLine, signalLine)
+
+// Short: RSI crosses down from 75
+shortSignal = ta.crossunder(rsi, shortEntry) and (tradeDirection == "Short Only" or tradeDirection == "Both")
+
+// Short exit: MACD crosses above signal line (bullish cross)
+shortExitSignal = ta.crossover(macdLine, signalLine)
+
+//========================
+// Calculate SL/TP
+//========================
+longSL = useSL ? close * (1 - slPct / 100) : na
+longTP = useTP ? close * (1 + tpPct / 100) : na
+shortSL = useSL ? close * (1 + slPct / 100) : na
+shortTP = useTP ? close * (1 - tpPct / 100) : na
+
+//========================
+// Execute Trades
+//========================
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+    if useSL or useTP
+        strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP)
+
+if longExitSignal and strategy.position_size > 0
+    strategy.close("Long")
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+    if useSL or useTP
+        strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP)
+
+if shortExitSignal and strategy.position_size < 0
+    strategy.close("Short")
+
+//========================
+// Plotting
+//========================
+plot(rsi, "RSI", color=color.blue, linewidth=2)
+hline(shortEntry, "Short Entry (75)", color=color.red, linestyle=hline.style_dashed)
+hline(50, "Midline", color=color.gray, linestyle=hline.style_dotted)
+hline(longEntry, "Long Entry (25)", color=color.green, linestyle=hline.style_dashed)
+
+plot(macdLine, "MACD", color=color.blue, linewidth=2)
+plot(signalLine, "Signal", color=color.orange, linewidth=2)
+plot(macdHist, "Histogram", color=macdHist >= 0 ? color.green : color.red, style=plot.style_histogram)
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dotted)
+
+plotshape(longSignal, "Long Entry", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(longExitSignal, "Long Exit", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(shortSignal, "Short Entry", shape.triangledown, location.abovebar, color.red, size=size.small)
+plotshape(shortExitSignal, "Short Exit", shape.triangleup, location.belowbar, color.green, size=size.small)
+
+bgcolor(rsi > shortEntry ? color.new(color.red, 90) : rsi < longEntry ? color.new(color.green, 90) : na)

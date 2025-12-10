@@ -1,0 +1,37 @@
+🧪 Testing Margin Amount in OANDA
+==================================
+
+📊 Current margin setting: $5000
+⚡ Expected leverage: 50:1
+�� Expected position size: ~$250,000
+
+🔍 Step 1: Check current status...
+{"positions":{}}
+
+
+📊 Step 2: Trigger LONG entry condition 1 - RSI above 50...
+{"message":"RSI above 50 condition set","status":"success"}
+
+
+⏳ Waiting 2 seconds...
+📊 Step 3: Trigger LONG entry condition 2 - MA1 cross up MA2...
+🎯 This should open a LONG position with margin-based sizing
+
+{"message":"MA#1 cross up MA#2 + strategy → LONG opened","status":"success"}
+
+
+⏳ Waiting 3 seconds for position to open...
+📋 Step 4: Check final position status...
+{"positions":{"EUR_USD":{"Symbol":"EUR_USD","PositionOpen":true,"Position":"long","TradeID":"1272","Exchange":"OANDA","IsSimulated":false,"SimulatedEntry":"","SimulatedExit":"","SimulatedPrice":"","SimulatedExitPrice":"","SimulatedPL":"","LatestPrice":"1.0855","MACDCrossedUp":false,"MACDCrossedDown":false,"SwingHigh":0,"SwingLow":0,"StochInOversold":false,"StochInOverbought":false,"StochRSICrossedUp20":false,"StochRSICrossedDown20":false,"StochRSICrossedUp50":false,"StochRSICrossedDown50":false,"StochRSICrossedUp80":false,"StochRSICrossedDown80":false,"RSIAbove50":false,"RSIBelow50":false,"RSICrossedUp25":false,"RSICrossedDown25":false,"RSICrossedUp30":false,"RSICrossedDown30":false,"RSICrossedUp40":false,"RSICrossedDown40":false,"RSICrossedUp60":false,"RSICrossedDown60":false,"RSICrossedUp70":false,"RSICrossedDown70":false,"RSICrossedUp75":false,"RSICrossedDown75":false,"PriceAboveEMA9":false,"PriceBelowEMA9":false,"PriceAboveEMA50":false,"PriceBelowEMA50":false,"PriceAboveEMA20":false,"PriceBelowEMA20":false,"PriceAboveEMA200":false,"PriceBelowEMA200":false,"EMA9CrossedUpEMA21":false,"EMA9CrossedDownEMA21":false,"EMA9AboveEMA21":false,"EMA9BelowEMA21":false,"ATRAboveAverage":false,"ATRBelowAverage":false,"MACDHistIncreasing":false,"MACDHistDecreasing":false,"MACDHistAboveZero":false,"MACDHistBelowZero":false,"MARibbonBullish":false,"MARibbonBearish":false,"EMA9EMA21StateInitialized":false,"EntryConditionsCompleted":{},"ExitConditionsCompleted":{}}}}
+
+
+================================================
+✅ Test complete!
+
+📊 Check the bot logs for margin calculation details:
+   Look for lines like:
+   💰 [MARGIN] Using margin amount: $5000.00
+   💱 [MARGIN CALC] Price: X.XXXXX, Leverage: 50:1
+   💱 [MARGIN CALC] Margin per unit: $X.XXXXXX
+   💱 [POSITION SIZE] XXXXX units × $X.XXXXX = $XXXXXX.XX position
+

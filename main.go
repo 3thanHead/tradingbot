@@ -90,20 +90,22 @@ type PositionStrategy struct {
 
 // Position state for each symbol
 type PositionState struct {
-	Symbol          string
-	PositionOpen    bool
-	Position        string // "long" or "short"
-	TradeID         string
-	Exchange        string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
-	IsSimulated     bool    // True if this is a simulated trade (non-OANDA)
-	SimulatedEntry  string  // Entry time for simulated trade
-	SimulatedExit   string  // Exit time for simulated trade
-	SimulatedPrice  string  // Entry price for simulated trade
-	LatestPrice     string  // Latest price from webhook (for P/L calculation)
-	MACDCrossedUp   bool    // Tracks if MACD crossed up
-	MACDCrossedDown bool    // Tracks if MACD crossed down
-	SwingHigh       float64 // Latest swing high price level
-	SwingLow        float64 // Latest swing low price level
+	Symbol             string
+	PositionOpen       bool
+	Position           string // "long" or "short"
+	TradeID            string
+	Exchange           string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
+	IsSimulated        bool    // True if this is a simulated trade (non-OANDA)
+	SimulatedEntry     string  // Entry time for simulated trade
+	SimulatedExit      string  // Exit time for simulated trade
+	SimulatedPrice     string  // Entry price for simulated trade
+	SimulatedExitPrice string  // Exit price for simulated trade
+	SimulatedPL        string  // Final P/L for simulated trade (stored on close)
+	LatestPrice        string  // Latest price from webhook (for P/L calculation)
+	MACDCrossedUp      bool    // Tracks if MACD crossed up
+	MACDCrossedDown    bool    // Tracks if MACD crossed down
+	SwingHigh          float64 // Latest swing high price level
+	SwingLow           float64 // Latest swing low price level
 
 	// Stochastic indicator tracking
 	StochInOversold   bool // Both K and D lines are in oversold (<20)
@@ -153,6 +155,10 @@ type PositionState struct {
 	EMA9AboveEMA21 bool // EMA 9 is currently above EMA 21
 	EMA9BelowEMA21 bool // EMA 9 is currently below EMA 21
 
+	// MA Ribbon position tracking (for MA1/MA2/MA3 alignment)
+	MA2AboveMA3 bool // MA2 is currently above MA3
+	MA2BelowMA3 bool // MA2 is currently below MA3
+
 	// ATR volatility tracking
 	ATRAboveAverage bool // ATR is above its 20-period average (high volatility)
 	ATRBelowAverage bool // ATR is below its 20-period average (low volatility)
@@ -166,6 +172,12 @@ type PositionState struct {
 	// MA Ribbon tracking
 	MARibbonBullish bool // MA ribbon aligned bullish (5>10>20>50>100)
 	MARibbonBearish bool // MA ribbon aligned bearish (5<10<20<50<100)
+
+	// SMC (Smart Money Concept) structure tracking
+	SMCLowLow   bool // SMC Lower Low (LL) detected
+	SMCHighLow  bool // SMC Higher Low (HL) detected
+	SMCLowHigh  bool // SMC Lower High (LH) detected
+	SMCHighHigh bool // SMC Higher High (HH) detected
 
 	// Cross detection initialization tracking
 	EMA9EMA21StateInitialized bool // True once we've seen at least one position state (prevents false crosses on startup)
@@ -765,6 +777,14 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.EMA9CrossedUpEMA21 // Reuse EMA 9/21 state for MA#1/MA#2
 	case "/webhook/ma/ma1-cross-down-ma2":
 		return state.EMA9CrossedDownEMA21 // Reuse EMA 9/21 state for MA#1/MA#2
+	case "/webhook/ma/ma1-above-ma2":
+		return state.EMA9AboveEMA21
+	case "/webhook/ma/ma1-below-ma2":
+		return state.EMA9BelowEMA21
+	case "/webhook/ma/ma2-above-ma3":
+		return state.MA2AboveMA3
+	case "/webhook/ma/ma2-below-ma3":
+		return state.MA2BelowMA3
 
 	// EMA crossover conditions
 	case "/webhook/ema/9-cross-up-21":
@@ -823,6 +843,16 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.ATRAboveAverage
 	case "/webhook/atr/below-average":
 		return state.ATRBelowAverage
+
+	// SMC (Smart Money Concept) structure conditions
+	case "/webhook/smc/low-low":
+		return state.SMCLowLow
+	case "/webhook/smc/high-low":
+		return state.SMCHighLow
+	case "/webhook/smc/low-high":
+		return state.SMCLowHigh
+	case "/webhook/smc/high-high":
+		return state.SMCHighHigh
 
 	default:
 		// For unknown webhooks, fall back to checking if condition was completed
@@ -2950,51 +2980,14 @@ func handleMA1AboveMA2(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
+	log.Printf("📊 MA#1 above MA#2 for %s", symbol)
+
 	mu.Lock()
-	wasBelow := state.EMA9BelowEMA21
-	wasInitialized := state.EMA9EMA21StateInitialized
 	state.EMA9AboveEMA21 = true
 	state.EMA9BelowEMA21 = false
-	state.EMA9EMA21StateInitialized = true
-
-	// Detect cross: was below, now above = bullish cross (only if we've seen previous state)
-	if wasBelow && wasInitialized {
-		state.EMA9CrossedUpEMA21 = true
-		state.EMA9CrossedDownEMA21 = false
-		mu.Unlock()
-
-		log.Printf("📊 MA#1 CROSSED UP through MA#2 for %s (detected internally)", symbol)
-
-		if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
-			log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
-			openLongPosition(symbol, event.Close)
-			respondSuccess(w, "MA#1 above MA#2 (crossed) + strategy → LONG opened")
-			return
-		}
-
-		// Check if we should exit SHORT position
-		if state.PositionOpen && state.Position == "short" {
-			shouldExit, reason := shouldExitPosition(symbol, false, r)
-			if shouldExit {
-				log.Printf("⚠️  [EXIT] %s → closing SHORT position", reason)
-				closePosition(symbol)
-				respondSuccess(w, fmt.Sprintf("MA#1 crossed above MA#2: %s → closed SHORT", reason))
-				return
-			}
-		}
-
-		respondSuccess(w, "MA#1 crossed above MA#2 (detected)")
-		return
-	}
 	mu.Unlock()
 
-	if !wasInitialized {
-		log.Printf("📊 MA#1 above MA#2 for %s (state initialized, waiting for cross)", symbol)
-		respondSuccess(w, "MA#1 above MA#2 (initialized)")
-	} else {
-		log.Printf("📊 MA#1 remains above MA#2 for %s (no cross)", symbol)
-		respondSuccess(w, "MA#1 above MA#2 (no cross)")
-	}
+	respondSuccess(w, "MA#1 above MA#2 condition set")
 }
 
 // POST /webhook/ma/ma1-below-ma2
@@ -3021,51 +3014,439 @@ func handleMA1BelowMA2(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
+	log.Printf("📊 MA#1 below MA#2 for %s", symbol)
+
 	mu.Lock()
-	wasAbove := state.EMA9AboveEMA21
-	wasInitialized := state.EMA9EMA21StateInitialized
 	state.EMA9BelowEMA21 = true
 	state.EMA9AboveEMA21 = false
-	state.EMA9EMA21StateInitialized = true
-
-	// Detect cross: was above, now below = bearish cross (only if we've seen previous state)
-	if wasAbove && wasInitialized {
-		state.EMA9CrossedDownEMA21 = true
-		state.EMA9CrossedUpEMA21 = false
-		mu.Unlock()
-
-		log.Printf("📊 MA#1 CROSSED DOWN through MA#2 for %s (detected internally)", symbol)
-
-		// Check if we should exit LONG position
-		if state.PositionOpen && state.Position == "long" {
-			shouldExit, reason := shouldExitPosition(symbol, true, r)
-			if shouldExit {
-				log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
-				closePosition(symbol)
-				respondSuccess(w, fmt.Sprintf("MA#1 crossed below MA#2: %s → closed LONG", reason))
-				return
-			}
-		}
-
-		if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
-			log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
-			openShortPosition(symbol, event.Close)
-			respondSuccess(w, "MA#1 below MA#2 (crossed) + strategy → SHORT opened")
-			return
-		}
-
-		respondSuccess(w, "MA#1 crossed below MA#2 (detected)")
-		return
-	}
 	mu.Unlock()
 
-	if !wasInitialized {
-		log.Printf("📊 MA#1 below MA#2 for %s (state initialized, waiting for cross)", symbol)
-		respondSuccess(w, "MA#1 below MA#2 (initialized)")
-	} else {
-		log.Printf("📊 MA#1 remains below MA#2 for %s (no cross)", symbol)
-		respondSuccess(w, "MA#1 below MA#2 (no cross)")
+	respondSuccess(w, "MA#1 below MA#2 condition set")
+}
+
+// POST /webhook/ma/ma2-above-ma3
+func handleMA2AboveMA3(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ma/ma2-above-ma3") {
+		log.Printf("⏭️  [WEBHOOK] MA#2 Above MA#3 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
 	}
+
+	log.Printf("🔔 [WEBHOOK] Received MA#2 Above MA#3 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 MA#2 above MA#3 for %s", symbol)
+
+	mu.Lock()
+	state.MA2AboveMA3 = true
+	state.MA2BelowMA3 = false
+	mu.Unlock()
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA#2 above MA#3 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA#2 above MA#3 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MA#2 above MA#3 condition set")
+}
+
+// POST /webhook/ma/ma2-below-ma3
+func handleMA2BelowMA3(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ma/ma2-below-ma3") {
+		log.Printf("⏭️  [WEBHOOK] MA#2 Below MA#3 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MA#2 Below MA#3 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 MA#2 below MA#3 for %s", symbol)
+
+	mu.Lock()
+	state.MA2BelowMA3 = true
+	state.MA2AboveMA3 = false
+	mu.Unlock()
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA#2 below MA#3 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA#2 below MA#3 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MA#2 below MA#3 condition set")
+}
+
+// ============================================================================
+// SMC (SMART MONEY CONCEPT) STRUCTURE HANDLERS
+// ============================================================================
+
+// POST /webhook/smc/low-low
+func handleSMCLowLow(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/smc/low-low") {
+		log.Printf("⏭️  [WEBHOOK] SMC Lower Low not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received SMC Lower Low (LL) event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 SMC Lower Low (LL) detected for %s", symbol)
+
+	mu.Lock()
+	state.SMCLowLow = true
+	mu.Unlock()
+
+	// Check if we should open LONG position (LL is a potential reversal)
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position on SMC LL")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "SMC Lower Low → LONG opened")
+		return
+	}
+
+	// Check if we should exit SHORT position (LL is bearish continuation confirmation)
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, "SMC Lower Low → SHORT closed")
+			return
+		}
+	}
+
+	respondSuccess(w, "SMC Lower Low condition set")
+}
+
+// POST /webhook/smc/high-low
+func handleSMCHighLow(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/smc/high-low") {
+		log.Printf("⏭️  [WEBHOOK] SMC Higher Low not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received SMC Higher Low (HL) event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 SMC Higher Low (HL) detected for %s", symbol)
+
+	mu.Lock()
+	state.SMCHighLow = true
+	mu.Unlock()
+
+	// Check if we should open LONG position (HL is bullish continuation)
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position on SMC HL")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "SMC Higher Low → LONG opened")
+		return
+	}
+
+	// Check if we should exit SHORT position (HL is bullish signal)
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, "SMC Higher Low → SHORT closed")
+			return
+		}
+	}
+
+	respondSuccess(w, "SMC Higher Low condition set")
+}
+
+// POST /webhook/smc/low-high
+func handleSMCLowHigh(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/smc/low-high") {
+		log.Printf("⏭️  [WEBHOOK] SMC Lower High not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received SMC Lower High (LH) event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 SMC Lower High (LH) detected for %s", symbol)
+
+	mu.Lock()
+	state.SMCLowHigh = true
+	mu.Unlock()
+
+	// Check if we should open SHORT position (LH is bearish continuation)
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position on SMC LH")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "SMC Lower High → SHORT opened")
+		return
+	}
+
+	// Check if we should exit LONG position (LH is bearish signal)
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️  [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, "SMC Lower High → LONG closed")
+			return
+		}
+	}
+
+	respondSuccess(w, "SMC Lower High condition set")
+}
+
+// POST /webhook/smc/high-high
+func handleSMCHighHigh(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/smc/high-high") {
+		log.Printf("⏭️  [WEBHOOK] SMC Higher High not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received SMC Higher High (HH) event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 SMC Higher High (HH) detected for %s", symbol)
+
+	mu.Lock()
+	state.SMCHighHigh = true
+	mu.Unlock()
+
+	// Check if we should open SHORT position (HH is a potential reversal)
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position on SMC HH")
+		openShortPosition(symbol, event.Close)
+	}
+
+	// Check if we should close LONG position
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("✅ [TRADE] %s - Closing LONG position on SMC HH", reason)
+			closePosition(symbol)
+		}
+	}
+
+	respondSuccess(w, "SMC Higher High processed")
+}
+
+// ============================================================================
+// Generic TradingView Webhook Handlers
+// ============================================================================
+
+func handleGenericTakeLongPosition(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/generic/take-long-position") {
+		log.Printf("⏭️  [WEBHOOK] Generic take-long-position not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Generic Take Long Position event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Generic Take Long Position signal for %s", symbol)
+
+	// Immediately open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Opening LONG position from generic signal")
+		openLongPosition(symbol, event.Close)
+	}
+
+	respondSuccess(w, "Generic take long position processed")
+}
+
+func handleGenericTakeShortPosition(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/generic/take-short-position") {
+		log.Printf("⏭️  [WEBHOOK] Generic take-short-position not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Generic Take Short Position event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Generic Take Short Position signal for %s", symbol)
+
+	// Immediately open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Opening SHORT position from generic signal")
+		openShortPosition(symbol, event.Close)
+	}
+
+	respondSuccess(w, "Generic take short position processed")
+}
+
+func handleGenericExit(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/generic/exit") {
+		log.Printf("⏭️  [WEBHOOK] Generic exit not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Generic Exit event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Generic Exit signal for %s", symbol)
+
+	// Close any open position (long or short)
+	if state.PositionOpen {
+		if state.Position == "long" {
+			shouldExit, reason := shouldExitPosition(symbol, true, r)
+			if shouldExit {
+				log.Printf("✅ [TRADE] %s - Closing LONG position from generic exit signal", reason)
+				closePosition(symbol)
+			}
+		} else if state.Position == "short" {
+			shouldExit, reason := shouldExitPosition(symbol, false, r)
+			if shouldExit {
+				log.Printf("✅ [TRADE] %s - Closing SHORT position from generic exit signal", reason)
+				closePosition(symbol)
+			}
+		}
+	}
+
+	respondSuccess(w, "Generic exit processed")
 }
 
 // ============================================================================
@@ -4762,6 +5143,8 @@ func resetIndicatorStates(state *PositionState) {
 	state.EMA9AboveEMA21 = false
 	state.EMA9BelowEMA21 = false
 	state.EMA9EMA21StateInitialized = false
+	state.MA2AboveMA3 = false
+	state.MA2BelowMA3 = false
 	state.ATRAboveAverage = false
 	state.ATRBelowAverage = false
 	state.MACDHistIncreasing = false
@@ -4770,6 +5153,10 @@ func resetIndicatorStates(state *PositionState) {
 	state.MACDHistBelowZero = false
 	state.MARibbonBullish = false
 	state.MARibbonBearish = false
+	state.SMCLowLow = false
+	state.SMCHighLow = false
+	state.SMCLowHigh = false
+	state.SMCHighHigh = false
 
 	// Also clear entry/exit condition tracking since indicators are reset
 	state.EntryConditionsCompleted = make(map[string]bool)
@@ -4902,10 +5289,20 @@ func openLongPosition(symbol string, price string) {
 
 	// Check if this is a non-OANDA exchange (simulated trade)
 	if exchange != "OANDA" && exchange != "" {
-		// Calculate position size with 1:10 leverage for simulation
+		// Calculate position size with appropriate leverage for simulation
 		var positionSize float64
 		var positionUnits int
-		leverage := 10.0 // 1:10 leverage for crypto/simulated trades
+
+		// Determine leverage based on symbol type
+		// Forex pairs typically use 50:1, crypto uses 10:1
+		leverage := 10.0 // Default for crypto
+		if strings.Contains(symbol, "_") {
+			parts := strings.Split(symbol, "_")
+			// Check if it's a forex pair (both are 3-letter currency codes)
+			if len(parts) == 2 && len(parts[0]) == 3 && len(parts[1]) == 3 {
+				leverage = 50.0 // Forex leverage
+			}
+		}
 
 		priceFloat, err := strconv.ParseFloat(price, 64)
 		if err != nil {
@@ -5044,10 +5441,20 @@ func openShortPosition(symbol string, price string) {
 	exchange = state.Exchange
 	mu.Unlock() // Check if this is a non-OANDA exchange (simulated trade)
 	if exchange != "OANDA" && exchange != "" {
-		// Calculate position size with 1:10 leverage for simulation
+		// Calculate position size with appropriate leverage for simulation
 		var positionSize float64
 		var positionUnits int
-		leverage := 10.0 // 1:10 leverage for crypto/simulated trades
+
+		// Determine leverage based on symbol type
+		// Forex pairs typically use 50:1, crypto uses 10:1
+		leverage := 10.0 // Default for crypto
+		if strings.Contains(symbol, "_") {
+			parts := strings.Split(symbol, "_")
+			// Check if it's a forex pair (both are 3-letter currency codes)
+			if len(parts) == 2 && len(parts[0]) == 3 && len(parts[1]) == 3 {
+				leverage = 50.0 // Forex leverage
+			}
+		}
 
 		priceFloat, err := strconv.ParseFloat(price, 64)
 		if err != nil {
@@ -5211,6 +5618,11 @@ func closePosition(symbol string) {
 		state.Position = ""
 		state.TradeID = ""
 		state.SimulatedExit = exitTime
+		state.SimulatedExitPrice = state.LatestPrice
+		// Store final P/L for summary display
+		if plDollars != 0 {
+			state.SimulatedPL = fmt.Sprintf("%s %s$%.5f / %s%.2f%%", plColor, plSign, plDollars, plSign, plPercent)
+		}
 		// Clear entry/exit tracking and reset indicator states
 		state.EntryConditionsCompleted = make(map[string]bool)
 		state.ExitConditionsCompleted = make(map[string]bool)
@@ -5294,6 +5706,61 @@ func closePosition(symbol string) {
 		log.Printf("❌ Failed to close position (status %d)", resp.StatusCode)
 		log.Printf("📄 [RESPONSE] %+v", responseBody)
 	}
+}
+
+// Get leverage (margin rate) for an instrument from OANDA
+func getOandaLeverage(symbol string) float64 {
+	url := fmt.Sprintf("%s/v3/accounts/%s/instruments/%s", oandaBaseURL, oandaAccountID, symbol)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		log.Printf("❌ [LEVERAGE] Failed to create request: %v", err)
+		return 50.0 // Default forex leverage
+	}
+
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("❌ [LEVERAGE] API request failed: %v", err)
+		return 50.0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("⚠️  [LEVERAGE] API returned status %d for %s", resp.StatusCode, symbol)
+		return 50.0
+	}
+
+	var result struct {
+		Instruments []struct {
+			Name       string `json:"name"`
+			MarginRate string `json:"marginRate"`
+		} `json:"instruments"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("❌ [LEVERAGE] Failed to decode response: %v", err)
+		return 50.0
+	}
+
+	if len(result.Instruments) > 0 {
+		marginRate, err := strconv.ParseFloat(result.Instruments[0].MarginRate, 64)
+		if err != nil {
+			log.Printf("❌ [LEVERAGE] Failed to parse margin rate: %v", err)
+			return 50.0
+		}
+		// Leverage = 1 / marginRate
+		// e.g., marginRate of 0.02 = 50:1 leverage (1 / 0.02 = 50)
+		leverage := 1.0 / marginRate
+		log.Printf("📊 [LEVERAGE] %s: Margin Rate = %s, Leverage = %.0f:1", symbol, result.Instruments[0].MarginRate, leverage)
+		return leverage
+	}
+
+	log.Printf("⚠️  [LEVERAGE] No instrument data for %s, using default 50:1", symbol)
+	return 50.0
 }
 
 func sendOandaOrder(orderData map[string]interface{}) (string, error) {
@@ -5591,6 +6058,32 @@ func reportStrategyStatus() {
 		log.Println("")
 	}
 
+	// Show recently closed positions
+	closedPositions := make([]string, 0)
+	for _, symbol := range symbols {
+		state := positions[symbol]
+		if !state.PositionOpen && state.SimulatedExit != "" {
+			closedPositions = append(closedPositions, symbol)
+		}
+	}
+
+	if len(closedPositions) > 0 {
+		log.Println(strings.Repeat("-", 80))
+		log.Printf("📜 CLOSED POSITIONS (Last Session)")
+		log.Println(strings.Repeat("-", 80))
+
+		for _, symbol := range closedPositions {
+			state := positions[symbol]
+			log.Printf("Symbol: %s [%s]", symbol, state.Exchange)
+			log.Printf("  Entry:  %s @ %s", state.SimulatedEntry, state.SimulatedPrice)
+			log.Printf("  Exit:   %s @ %s", state.SimulatedExit, state.SimulatedExitPrice)
+			if state.SimulatedPL != "" {
+				log.Printf("  P/L:    %s", state.SimulatedPL)
+			}
+			log.Println("")
+		}
+	}
+
 	log.Println(strings.Repeat("=", 80))
 }
 
@@ -5859,6 +6352,19 @@ func main() {
 	http.HandleFunc("/webhook/ma/ma1-cross-down-ma2", handleMA1CrossDownMA2)
 	http.HandleFunc("/webhook/ma/ma1-above-ma2", handleMA1AboveMA2) // Position tracking (cross detection)
 	http.HandleFunc("/webhook/ma/ma1-below-ma2", handleMA1BelowMA2) // Position tracking (cross detection)
+	http.HandleFunc("/webhook/ma/ma2-above-ma3", handleMA2AboveMA3) // Position tracking
+	http.HandleFunc("/webhook/ma/ma2-below-ma3", handleMA2BelowMA3) // Position tracking
+
+	// SMC (Smart Money Concept) Structure Webhooks
+	http.HandleFunc("/webhook/smc/low-low", handleSMCLowLow)     // Lower Low (LL)
+	http.HandleFunc("/webhook/smc/high-low", handleSMCHighLow)   // Higher Low (HL)
+	http.HandleFunc("/webhook/smc/low-high", handleSMCLowHigh)   // Lower High (LH)
+	http.HandleFunc("/webhook/smc/high-high", handleSMCHighHigh) // Higher High (HH)
+
+	// Generic TradingView Webhooks
+	http.HandleFunc("/webhook/generic/take-long-position", handleGenericTakeLongPosition)
+	http.HandleFunc("/webhook/generic/take-short-position", handleGenericTakeShortPosition)
+	http.HandleFunc("/webhook/generic/exit", handleGenericExit)
 
 	// RSI Directional Cross Webhooks (RSI crossing specific levels with direction)
 	http.HandleFunc("/webhook/rsi/cross-down-40", handleRSICrossDown40)

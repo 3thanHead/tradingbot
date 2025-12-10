@@ -1,0 +1,42 @@
+{
+  "name": "Generic TradingView Strategy",
+  "description": "Generic strategy that accepts any TradingView alert for entry and exit signals",
+  "margin_usd": 5000,
+  "instrument": "EUR_USD",
+  "long_entry": {
+    "combination_mode": "ANY",
+    "conditions": [
+      {
+        "webhook": "/webhook/generic/take-long-position",
+        "state": true
+      }
+    ]
+  },
+  "long_exit": {
+    "combination_mode": "ANY",
+    "conditions": [
+      {
+        "webhook": "/webhook/generic/exit",
+        "state": true
+      }
+    ]
+  },
+  "short_entry": {
+    "combination_mode": "ANY",
+    "conditions": [
+      {
+        "webhook": "/webhook/generic/take-short-position",
+        "state": true
+      }
+    ]
+  },
+  "short_exit": {
+    "combination_mode": "ANY",
+    "conditions": [
+      {
+        "webhook": "/webhook/generic/exit",
+        "state": true
+      }
+    ]
+  }
+}
