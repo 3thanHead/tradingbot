@@ -17,9 +17,9 @@ curl -s $BASE_URL/health
 echo ""
 echo ""
 
-# Simulate RSI > 70 scenario
-echo "2️⃣ Simulating RSI Crossed Up (Overbought)..."
-curl -s -X POST $BASE_URL/webhook/rsi/crossed-up \
+# Test RSI overbought exit (LONG exit signal)
+echo "2️⃣ Testing RSI Cross Down Overbuy 75 (LONG exit)..."
+curl -s -X POST $BASE_URL/webhook/rsi/cross-down-overbuy-75 \
   -H "Content-Type: application/json" \
   -d '{
     "ticker": "EUR_USD",
@@ -36,9 +36,9 @@ curl -s -X POST $BASE_URL/webhook/rsi/crossed-up \
 echo ""
 echo ""
 
-# Simulate RSI moving down (should trigger SHORT)
-echo "3️⃣ Simulating RSI Moving Down (Should trigger SHORT)..."
-curl -s -X POST $BASE_URL/webhook/rsi/moving-down \
+# Test SHORT entry signal
+echo "3️⃣ Testing RSI Cross Down 40 (SHORT entry signal)..."
+curl -s -X POST $BASE_URL/webhook/rsi/cross-down-40 \
   -H "Content-Type: application/json" \
   -d '{
     "ticker": "EUR_USD",
@@ -66,9 +66,9 @@ curl -s -X POST $BASE_URL/webhook/macd/cross-up \
 echo ""
 echo ""
 
-# Simulate MACD moving up (should close SHORT)
-echo "6️⃣ Simulating MACD Moving Up (Should close SHORT)..."
-curl -s -X POST $BASE_URL/webhook/macd/moving-up \
+# Test SHORT exit signal
+echo "6️⃣ Testing RSI Cross Up Oversell 25 (SHORT exit signal)..."
+curl -s -X POST $BASE_URL/webhook/rsi/cross-up-oversell-25 \
   -H "Content-Type: application/json" \
   -d '{
     "ticker": "EUR_USD",

@@ -15,7 +15,11 @@ services:
       - TAKE_PROFIT_PIPS=${TAKE_PROFIT_PIPS}
       - TAKE_PROFIT_DOLLARS=${TAKE_PROFIT_DOLLARS}
       - TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT}
-      - STRATEGY=${STRATEGY:-default}
+      - STOP_LOSS_PIPS=${STOP_LOSS_PIPS}
+      - STOP_LOSS_DOLLARS=${STOP_LOSS_DOLLARS}
+      - STOP_LOSS_PCT=${STOP_LOSS_PCT}
+      - STRATEGY_FILE=${STRATEGY_FILE:-ma_trend_rsi_macd}
+      - TIMEZONE_OFFSET=${TIMEZONE_OFFSET:-0}
     volumes:
       - ./strategies:/app/strategies:ro
     restart: unless-stopped
