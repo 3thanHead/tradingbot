@@ -92,6 +92,7 @@ type PositionStrategy struct {
 type PositionState struct {
 	Symbol             string
 	PositionOpen       bool
+	PositionOpening    bool    // True when position open is in progress (prevents duplicate opens)
 	Position           string // "long" or "short"
 	TradeID            string
 	Exchange           string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
@@ -155,13 +156,19 @@ type PositionState struct {
 	EMA9AboveEMA21 bool // EMA 9 is currently above EMA 21
 	EMA9BelowEMA21 bool // EMA 9 is currently below EMA 21
 
+	// MA cross event tracking (set only on actual crosses, not position changes)
+	MA1CrossedAboveMA2 bool // MA1 actually crossed above MA2 (requires state change)
+	MA1CrossedBelowMA2 bool // MA1 actually crossed below MA2 (requires state change)
+
 	// MA Ribbon position tracking (for MA1/MA2/MA3 alignment)
 	MA2AboveMA3 bool // MA2 is currently above MA3
 	MA2BelowMA3 bool // MA2 is currently below MA3
 
 	// ATR volatility tracking
-	ATRAboveAverage bool // ATR is above its 20-period average (high volatility)
-	ATRBelowAverage bool // ATR is below its 20-period average (low volatility)
+	ATRAboveAverage   bool // ATR is above its 20-period average (high volatility)
+	ATRBelowAverage   bool // ATR is below its 20-period average (low volatility)
+	ATRAboveThreshold bool // ATR is above a specific threshold value
+	ATRBelowThreshold bool // ATR is below a specific threshold value
 
 	// MACD histogram tracking
 	MACDHistIncreasing bool // MACD histogram is increasing
@@ -839,9 +846,9 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 	case "/webhook/ma/ma1-cross-down-ma2":
 		return state.EMA9CrossedDownEMA21 // Reuse EMA 9/21 state for MA#1/MA#2
 	case "/webhook/ma/ma1-above-ma2":
-		return state.EMA9AboveEMA21
+		return state.MA1CrossedAboveMA2 // Check if actual cross occurred
 	case "/webhook/ma/ma1-below-ma2":
-		return state.EMA9BelowEMA21
+		return state.MA1CrossedBelowMA2 // Check if actual cross occurred
 	case "/webhook/ma/ma2-above-ma3":
 		return state.MA2AboveMA3
 	case "/webhook/ma/ma2-below-ma3":
@@ -904,6 +911,10 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.ATRAboveAverage
 	case "/webhook/atr/below-average":
 		return state.ATRBelowAverage
+	case "/webhook/atr/above-threshold":
+		return state.ATRAboveThreshold
+	case "/webhook/atr/below-threshold":
+		return state.ATRBelowThreshold
 
 	// SMC (Smart Money Concept) structure conditions
 	case "/webhook/smc/low-low":
@@ -2202,6 +2213,122 @@ func handleRSIBelow50(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
+// ATR THRESHOLD HANDLERS
+// ============================================================================
+
+// POST /webhook/atr/above-threshold
+func handleATRAboveThreshold(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/above-threshold") {
+		log.Printf("⏭️  [WEBHOOK] ATR Above Threshold not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Above Threshold event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	trackOppositeDirection(symbol, "/webhook/atr/above-threshold")
+
+	log.Printf("📊 ATR is above threshold for %s (high volatility)", symbol)
+
+	mu.Lock()
+	state.ATRAboveThreshold = true
+	state.ATRBelowThreshold = false
+	mu.Unlock()
+
+	// Check if we should open position (can be used for either direction)
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "ATR above threshold + strategy → LONG opened")
+		return
+	}
+
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "ATR above threshold + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "ATR above threshold condition set")
+}
+
+// POST /webhook/atr/below-threshold
+func handleATRBelowThreshold(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/below-threshold") {
+		log.Printf("⏭️  [WEBHOOK] ATR Below Threshold not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Below Threshold event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	trackOppositeDirection(symbol, "/webhook/atr/below-threshold")
+
+	log.Printf("📊 ATR is below threshold for %s (low volatility)", symbol)
+
+	mu.Lock()
+	state.ATRBelowThreshold = true
+	state.ATRAboveThreshold = false
+	mu.Unlock()
+
+	// Check if we should open position (can be used for either direction)
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "ATR below threshold + strategy → LONG opened")
+		return
+	}
+
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "ATR below threshold + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "ATR below threshold condition set")
+}
+
+// ============================================================================
 // RSI CENTERLINE EXIT HANDLER
 // ============================================================================
 
@@ -3264,6 +3391,7 @@ func handleMA1AboveMA2(w http.ResponseWriter, r *http.Request) {
 	// Check if this is a cross by comparing with the opposite state
 	// MA1 was below MA2, now above = cross detected
 	wasCross := state.EMA9BelowEMA21
+	isFirstSignal := !state.EMA9EMA21StateInitialized
 
 	log.Printf("📊 MA#1 above MA#2 for %s", symbol)
 
@@ -3274,6 +3402,11 @@ func handleMA1AboveMA2(w http.ResponseWriter, r *http.Request) {
 	state.EMA9AboveEMA21 = true
 	state.EMA9BelowEMA21 = false
 	state.EMA9EMA21StateInitialized = true
+	// Set cross flag if: actual cross (state change) OR first signal (allow immediate entry)
+	if wasCross || isFirstSignal {
+		state.MA1CrossedAboveMA2 = true
+		state.MA1CrossedBelowMA2 = false
+	}
 	mu.Unlock()
 
 	// Only allow LONG entry if: no position open AND (first trade OR last was SHORT OR saw opposite cross after LONG close)
@@ -3328,6 +3461,7 @@ func handleMA1BelowMA2(w http.ResponseWriter, r *http.Request) {
 	// Check if this is a cross by comparing with the opposite state
 	// MA1 was above MA2, now below = cross detected
 	wasCross := state.EMA9AboveEMA21
+	isFirstSignal := !state.EMA9EMA21StateInitialized
 
 	log.Printf("📊 MA#1 below MA#2 for %s", symbol)
 
@@ -3338,6 +3472,11 @@ func handleMA1BelowMA2(w http.ResponseWriter, r *http.Request) {
 	state.EMA9BelowEMA21 = true
 	state.EMA9AboveEMA21 = false
 	state.EMA9EMA21StateInitialized = true
+	// Set cross flag if: actual cross (state change) OR first signal (allow immediate entry)
+	if wasCross || isFirstSignal {
+		state.MA1CrossedBelowMA2 = true
+		state.MA1CrossedAboveMA2 = false
+	}
 	mu.Unlock()
 
 	// Only allow SHORT entry if: no position open AND (first trade OR last was LONG OR saw opposite cross after SHORT close)
@@ -5598,6 +5737,8 @@ func resetIndicatorStates(state *PositionState) {
 	state.MA2BelowMA3 = false
 	state.ATRAboveAverage = false
 	state.ATRBelowAverage = false
+	state.ATRAboveThreshold = false
+	state.ATRBelowThreshold = false
 	state.MACDHistIncreasing = false
 	state.MACDHistDecreasing = false
 	state.MACDHistAboveZero = false
@@ -5703,25 +5844,39 @@ func openLongPosition(symbol string, price string) {
 	mu.Lock()
 	state := positions[symbol]
 
-	// Double-check position isn't already open (race condition protection)
+	// Double-check position isn't already open OR opening (race condition protection)
 	if state.PositionOpen {
 		mu.Unlock()
 		log.Printf("⚠️  [RACE] Position already open for %s - skipping duplicate open request", symbol)
 		return
 	}
+	if state.PositionOpening {
+		mu.Unlock()
+		log.Printf("⚠️  [RACE] Position already opening for %s - skipping duplicate open request", symbol)
+		return
+	}
 
+	// Set PositionOpening flag to block other concurrent open attempts
+	state.PositionOpening = true
 	exchange := state.Exchange
 	mu.Unlock()
 
-	// Determine if this will be a simulated trade
-	isSimulated := exchange != "OANDA" && exchange != ""
+	// Ensure we clear PositionOpening flag on exit (success or failure)
+	defer func() {
+		mu.Lock()
+		positions[symbol].PositionOpening = false
+		mu.Unlock()
+	}()
+
+	// Determine if this will be a simulated trade (only OANDA is non-simulated)
+	isSimulated := exchange != "OANDA"
 
 	// Check if any position is already open on the SAME exchange type
 	mu.RLock()
 	for sym, s := range positions {
 		if s.PositionOpen {
 			// Only block if same exchange type (both OANDA or both simulated)
-			otherIsSimulated := s.Exchange != "OANDA" && s.Exchange != ""
+			otherIsSimulated := s.Exchange != "OANDA"
 			if isSimulated == otherIsSimulated {
 				mu.RUnlock()
 				log.Println(strings.Repeat("🚫", 40))
@@ -5747,7 +5902,7 @@ func openLongPosition(symbol string, price string) {
 	mu.Unlock()
 
 	// Check if this is a non-OANDA exchange (simulated trade)
-	if exchange != "OANDA" && exchange != "" {
+	if exchange != "OANDA" {
 		// Calculate position size with appropriate leverage for simulation
 		var positionSize float64
 		var positionUnits int
@@ -5758,8 +5913,20 @@ func openLongPosition(symbol string, price string) {
 		if strings.Contains(symbol, "_") {
 			parts := strings.Split(symbol, "_")
 			// Check if it's a forex pair (both are 3-letter currency codes)
+			// But exclude crypto symbols (BTC, ETH, etc.)
 			if len(parts) == 2 && len(parts[0]) == 3 && len(parts[1]) == 3 {
-				leverage = 50.0 // Forex leverage
+				// Check if first part is a known crypto symbol
+				cryptos := []string{"BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "DOT", "DOGE", "SOL", "MATIC", "AVAX", "LINK"}
+				isCrypto := false
+				for _, crypto := range cryptos {
+					if parts[0] == crypto {
+						isCrypto = true
+						break
+					}
+				}
+				if !isCrypto {
+					leverage = 50.0 // Forex leverage
+				}
 			}
 		}
 
@@ -5867,25 +6034,39 @@ func openShortPosition(symbol string, price string) {
 	mu.Lock()
 	state := positions[symbol]
 
-	// Double-check position isn't already open (race condition protection)
+	// Double-check position isn't already open OR opening (race condition protection)
 	if state.PositionOpen {
 		mu.Unlock()
 		log.Printf("⚠️  [RACE] Position already open for %s - skipping duplicate open request", symbol)
 		return
 	}
+	if state.PositionOpening {
+		mu.Unlock()
+		log.Printf("⚠️  [RACE] Position already opening for %s - skipping duplicate open request", symbol)
+		return
+	}
 
+	// Set PositionOpening flag to block other concurrent open attempts
+	state.PositionOpening = true
 	exchange := state.Exchange
 	mu.Unlock()
 
-	// Determine if this will be a simulated trade
-	isSimulated := exchange != "OANDA" && exchange != ""
+	// Ensure we clear PositionOpening flag on exit (success or failure)
+	defer func() {
+		mu.Lock()
+		positions[symbol].PositionOpening = false
+		mu.Unlock()
+	}()
+
+	// Determine if this will be a simulated trade (only OANDA is non-simulated)
+	isSimulated := exchange != "OANDA"
 
 	// Check if any position is already open on the SAME exchange type
 	mu.RLock()
 	for sym, s := range positions {
 		if s.PositionOpen {
 			// Only block if same exchange type (both OANDA or both simulated)
-			otherIsSimulated := s.Exchange != "OANDA" && s.Exchange != ""
+			otherIsSimulated := s.Exchange != "OANDA"
 			if isSimulated == otherIsSimulated {
 				mu.RUnlock()
 				log.Println(strings.Repeat("🚫", 40))
@@ -5908,8 +6089,10 @@ func openShortPosition(symbol string, price string) {
 	mu.Lock()
 	state = positions[symbol]
 	exchange = state.Exchange
-	mu.Unlock() // Check if this is a non-OANDA exchange (simulated trade)
-	if exchange != "OANDA" && exchange != "" {
+	mu.Unlock()
+
+	// Check if this is a non-OANDA exchange (simulated trade)
+	if exchange != "OANDA" {
 		// Calculate position size with appropriate leverage for simulation
 		var positionSize float64
 		var positionUnits int
@@ -5920,8 +6103,20 @@ func openShortPosition(symbol string, price string) {
 		if strings.Contains(symbol, "_") {
 			parts := strings.Split(symbol, "_")
 			// Check if it's a forex pair (both are 3-letter currency codes)
+			// But exclude crypto symbols (BTC, ETH, etc.)
 			if len(parts) == 2 && len(parts[0]) == 3 && len(parts[1]) == 3 {
-				leverage = 50.0 // Forex leverage
+				// Check if first part is a known crypto symbol
+				cryptos := []string{"BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "DOT", "DOGE", "SOL", "MATIC", "AVAX", "LINK"}
+				isCrypto := false
+				for _, crypto := range cryptos {
+					if parts[0] == crypto {
+						isCrypto = true
+						break
+					}
+				}
+				if !isCrypto {
+					leverage = 50.0 // Forex leverage
+				}
 			}
 		}
 
@@ -6815,6 +7010,10 @@ func main() {
 	// MACD Webhooks
 	http.HandleFunc("/webhook/macd/cross-up", handleMACDCrossUp)
 	http.HandleFunc("/webhook/macd/cross-down", handleMACDCrossDown)
+
+	// ATR Threshold Webhooks
+	http.HandleFunc("/webhook/atr/above-threshold", handleATRAboveThreshold)
+	http.HandleFunc("/webhook/atr/below-threshold", handleATRBelowThreshold)
 
 	// Stochastic Webhooks
 	http.HandleFunc("/webhook/stochastic/oversold", handleStochasticOversold)

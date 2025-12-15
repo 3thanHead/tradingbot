@@ -12,13 +12,18 @@
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ma/price-above-ma2",
-          "comment": "Price above MA2 (21 EMA)"
+          "webhook": "/webhook/ma/price-above-ma4",
+          "comment": "Price above MA4"
         },
         {
           "type": "condition",
           "webhook": "/webhook/rsi/above-50",
           "comment": "RSI is above 50"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/above-threshold",
+          "comment": "ATR above threshold - high volatility filter"
         },
         {
           "type": "condition",
@@ -30,11 +35,6 @@
     "exit": {
       "combination": "any",
       "conditions": [
-        {
-          "type": "condition",
-          "webhook": "/webhook/rsi/cross-down-overbuy",
-          "comment": "RSI crosses down from overbought"
-        },
         {
           "type": "condition",
           "webhook": "/webhook/ma/ma1-below-ma2",
@@ -54,13 +54,18 @@
         },
         {
           "type": "condition",
-          "webhook": "/webhook/ma/price-below-ma2",
-          "comment": "Price below MA2 (21 EMA)"
+          "webhook": "/webhook/ma/price-below-ma4",
+          "comment": "Price below MA4"
         },
         {
           "type": "condition",
           "webhook": "/webhook/rsi/below-50",
           "comment": "RSI is below 50"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/above-threshold",
+          "comment": "ATR above threshold - high volatility filter"
         },
         {
           "type": "condition",
@@ -72,11 +77,6 @@
     "exit": {
       "combination": "any",
       "conditions": [
-        {
-          "type": "condition",
-          "webhook": "/webhook/rsi/cross-up-oversell",
-          "comment": "RSI crosses up from oversold"
-        },
         {
           "type": "condition",
           "webhook": "/webhook/ma/ma1-above-ma2",
