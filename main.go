@@ -92,7 +92,7 @@ type PositionStrategy struct {
 type PositionState struct {
 	Symbol             string
 	PositionOpen       bool
-	PositionOpening    bool    // True when position open is in progress (prevents duplicate opens)
+	PositionOpening    bool   // True when position open is in progress (prevents duplicate opens)
 	Position           string // "long" or "short"
 	TradeID            string
 	Exchange           string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
@@ -163,6 +163,10 @@ type PositionState struct {
 	// MA Ribbon position tracking (for MA1/MA2/MA3 alignment)
 	MA2AboveMA3 bool // MA2 is currently above MA3
 	MA2BelowMA3 bool // MA2 is currently below MA3
+	
+	// MA1 vs MA4 position tracking
+	MA1AboveMA4 bool // MA1 is currently above MA4
+	MA1BelowMA4 bool // MA1 is currently below MA4
 
 	// ATR volatility tracking
 	ATRAboveAverage   bool // ATR is above its 20-period average (high volatility)
@@ -853,6 +857,10 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.MA2AboveMA3
 	case "/webhook/ma/ma2-below-ma3":
 		return state.MA2BelowMA3
+	case "/webhook/ma/ma1-above-ma4":
+		return state.MA1AboveMA4
+	case "/webhook/ma/ma1-below-ma4":
+		return state.MA1BelowMA4
 
 	// EMA crossover conditions
 	case "/webhook/ema/9-cross-up-21":
@@ -2303,29 +2311,16 @@ func handleATRBelowThreshold(w http.ResponseWriter, r *http.Request) {
 	// Track if this is an opposite direction condition
 	trackOppositeDirection(symbol, "/webhook/atr/below-threshold")
 
-	log.Printf("📊 ATR is below threshold for %s (low volatility)", symbol)
+	log.Printf("📊 ATR is below threshold for %s (low volatility - blocking entries)", symbol)
 
 	mu.Lock()
 	state.ATRBelowThreshold = true
 	state.ATRAboveThreshold = false
 	mu.Unlock()
 
-	// Check if we should open position (can be used for either direction)
-	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
-		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
-		openLongPosition(symbol, event.Close)
-		respondSuccess(w, "ATR below threshold + strategy → LONG opened")
-		return
-	}
-
-	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
-		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
-		openShortPosition(symbol, event.Close)
-		respondSuccess(w, "ATR below threshold + strategy → SHORT opened")
-		return
-	}
-
-	respondSuccess(w, "ATR below threshold condition set")
+	// ATR below threshold should prevent new entries - no position checks
+	log.Printf("⛔ ATR below threshold - no new positions allowed")
+	respondSuccess(w, "ATR below threshold - no entries")
 }
 
 // ============================================================================
@@ -3614,6 +3609,118 @@ func handleMA2BelowMA3(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondSuccess(w, "MA#2 below MA#3 condition set")
+}
+
+// POST /webhook/ma/ma1-above-ma4
+func handleMA1AboveMA4(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ma/ma1-above-ma4") {
+		log.Printf("⏭️  [WEBHOOK] MA#1 Above MA#4 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MA#1 Above MA#4 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	trackOppositeDirection(symbol, "/webhook/ma/ma1-above-ma4")
+
+	log.Printf("📊 MA#1 above MA#4 for %s", symbol)
+
+	mu.Lock()
+	state.MA1AboveMA4 = true
+	state.MA1BelowMA4 = false
+	mu.Unlock()
+
+	// Only allow LONG entry if reversal requirement met
+	canEnterLong := !state.PositionOpen && (state.LastClosedDirection == "" || state.LastClosedDirection == "short" || state.OppositeDirectionOccurred)
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && canEnterLong {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 above MA#4 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 above MA#4 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MA#1 above MA#4 condition set")
+}
+
+// POST /webhook/ma/ma1-below-ma4
+func handleMA1BelowMA4(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ma/ma1-below-ma4") {
+		log.Printf("⏭️  [WEBHOOK] MA#1 Below MA#4 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MA#1 Below MA#4 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	trackOppositeDirection(symbol, "/webhook/ma/ma1-below-ma4")
+
+	log.Printf("📊 MA#1 below MA#4 for %s", symbol)
+
+	mu.Lock()
+	state.MA1BelowMA4 = true
+	state.MA1AboveMA4 = false
+	mu.Unlock()
+
+	// Only allow SHORT entry if reversal requirement met
+	canEnterShort := !state.PositionOpen && (state.LastClosedDirection == "" || state.LastClosedDirection == "long" || state.OppositeDirectionOccurred)
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 below MA#4 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && canEnterShort {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 below MA#4 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MA#1 below MA#4 condition set")
 }
 
 // ============================================================================
@@ -7054,6 +7161,8 @@ func main() {
 	http.HandleFunc("/webhook/ma/ma1-below-ma2", handleMA1BelowMA2) // Position tracking (cross detection)
 	http.HandleFunc("/webhook/ma/ma2-above-ma3", handleMA2AboveMA3) // Position tracking
 	http.HandleFunc("/webhook/ma/ma2-below-ma3", handleMA2BelowMA3) // Position tracking
+	http.HandleFunc("/webhook/ma/ma1-above-ma4", handleMA1AboveMA4) // Position tracking
+	http.HandleFunc("/webhook/ma/ma1-below-ma4", handleMA1BelowMA4) // Position tracking
 
 	// SMC (Smart Money Concept) Structure Webhooks
 	http.HandleFunc("/webhook/smc/low-low", handleSMCLowLow)     // Lower Low (LL)
