@@ -1,0 +1,48 @@
+{
+  "name": "MA Trend + ATR Exit Strategy",
+  "description": "Simple trend-following: Enter when price is above/below MA, exit on ATR signal.",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/ma1-above-ma2",
+          "comment": "MA1 above MA2 - enter long"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/short",
+          "comment": "ATR Short signal for Long exit"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/ma1-below-ma2",
+          "comment": "MA1 below MA2 - enter short"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/long",
+          "comment": "ATR Long signal for Short Exit"
+        }
+      ]
+    }
+  }
+}

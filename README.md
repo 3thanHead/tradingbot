@@ -56,6 +56,13 @@ TAKE_PROFIT_PIPS=50           # Set TP in pips
 TAKE_PROFIT_DOLLARS=100       # Set TP in dollars
 TAKE_PROFIT_PCT=2.5           # Set TP in percentage
 
+# Trading Hours (optional - restrict when trades can be opened)
+TRADING_START_HOUR=9          # Start time: "9" or "9:30" (supports minutes)
+TRADING_END_HOUR=17           # End time: "17" or "16:45" (supports minutes)
+TRADING_DAYS=1,2,3,4,5        # Days to trade (0=Sun..6=Sat) or mon,tue,wed,thu,fri
+TRADING_TIMEZONE=America/New_York  # Timezone for trading hours (or use TIMEZONE_OFFSET)
+TIMEZONE_OFFSET=-5            # UTC offset if TRADING_TIMEZONE not set
+
 # Ngrok (required for webhooks)
 NGROK_AUTHTOKEN=your_token
 NGROK_STATIC_DOMAIN=your-bot.ngrok-free.app  # Optional but recommended
@@ -82,6 +89,7 @@ https://your-bot.ngrok-free.app/webhook/ma/ribbon-bearish
 
 - **[strategies/README.md](strategies/README.md)** - Create and edit trading strategies
 - **[docs/TRADINGVIEW_ALERTS.md](docs/TRADINGVIEW_ALERTS.md)** - TradingView webhook setup
+- **[docs/TRADING_HOURS.md](docs/TRADING_HOURS.md)** - Trading hours and days restrictions
 - **[docs/TAKE_PROFIT.md](docs/TAKE_PROFIT.md)** - Take profit configuration
 - **[docs/NGROK_STATIC_DOMAIN.md](docs/NGROK_STATIC_DOMAIN.md)** - Static domain setup
 - **[docs/CHANGELOG.md](docs/CHANGELOG.md)** - Version history

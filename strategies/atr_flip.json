@@ -1,0 +1,58 @@
+{
+  "name": "ATR Trailing Stop Flip Strategy",
+  "description": "Simple trend-following strategy using ATR trailing stop direction flips. Goes long when ATR flips bullish, short when bearish.",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-above-ma4",
+          "comment": "Price above MA4 - trend filter"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/long",
+          "comment": "ATR is long"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/short",
+          "comment": "ATR is short"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/ma/price-below-ma4",
+          "comment": "Price below MA4 - trend filter"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/short",
+          "comment": "ATR is short"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/long",
+          "comment": "ATR is long"
+        }
+      ]
+    }
+  }
+}
