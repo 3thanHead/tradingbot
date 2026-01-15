@@ -1122,7 +1122,7 @@ func isPendingCross(webhookPath string, state *PositionState) bool {
 	if !state.ATRDirectionInitialized {
 		return false
 	}
-	
+
 	switch webhookPath {
 	case "/webhook/atr/long", "/webhook/atr/flip-long":
 		// Pending cross to long = we're currently in short direction
@@ -6716,6 +6716,22 @@ func syncPositionsFromOandaWithLogging(verbose bool) error {
 				state.EntryConditionsCompleted = make(map[string]bool)
 				state.ExitConditionsCompleted = make(map[string]bool)
 
+				// CRITICAL: Reset ATR direction state to prevent false re-entry
+				// When position is closed externally (manual close, SL, TP), we need to
+				// reset the ATR direction tracking so the next ATR signal is treated as
+				// initialization rather than a cross. This prevents the bug where price
+				// whipsaws and briefly crosses the ATR stop then flips back, causing
+				// an unwanted position re-open.
+				state.ATRDirectionInitialized = false
+				state.ATRDirectionLong = false
+				state.ATRLong = false
+				state.ATRShort = false
+				state.ATRLongCrossed = false
+				state.ATRShortCrossed = false
+				state.ATRFlipLong = false
+				state.ATRFlipShort = false
+				log.Printf("   🔄 Reset ATR direction state to prevent false re-entry on whipsaw")
+
 				// If one-trade mode, the strategy should already be disabled
 				// But if position was closed externally, we might want to keep strategy enabled
 				// for manual trades - leave strategy state as is
@@ -7723,7 +7739,7 @@ func reportEntryConditions(symbol string, direction string, entryConditions *Ent
 	totalCount := len(entryConditions.Conditions)
 	metCount := 0
 	readyCount := 0
-	
+
 	for i, condition := range entryConditions.Conditions {
 		var isMet bool
 		if condition.Type == "condition" && condition.Webhook != "" {
@@ -7740,7 +7756,7 @@ func reportEntryConditions(symbol string, direction string, entryConditions *Ent
 		status := "❌"
 		statusSuffix := ""
 		waitingForCross := false
-		
+
 		if condition.Type == "condition" && condition.Webhook != "" && requiresCrossEvent(condition.Webhook) {
 			// For cross-required conditions
 			hasCrossed := hasCrossedRecently(condition.Webhook, state)
@@ -7809,7 +7825,7 @@ func reportExitConditions(symbol string, direction string, exitConditions *ExitC
 
 		status := "❌"
 		statusSuffix := ""
-		
+
 		if condition.Type == "condition" && condition.Webhook != "" && requiresCrossEvent(condition.Webhook) {
 			// For cross-required exit conditions, only show ✅ if actually crossed
 			if isMet && hasCrossedRecently(condition.Webhook, state) {
