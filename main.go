@@ -183,8 +183,10 @@ type PositionState struct {
 	ATRFlipShort            bool // ATR trailing stop flipped to short (actual change detected)
 	ATRLong                 bool // ATR long signal
 	ATRShort                bool // ATR short signal
+	ATRIdle                 bool // ATR idle signal (trend conflict - no trading)
 	ATRLongCrossed          bool // ATR actually crossed to long (not just initial state)
 	ATRShortCrossed         bool // ATR actually crossed to short (not just initial state)
+	PositionOpenedWhileIdle bool // Position was opened externally while ATR was idle (wait for cross to close)
 
 	// MACD histogram tracking
 	MACDHistIncreasing bool // MACD histogram is increasing
@@ -205,11 +207,18 @@ type PositionState struct {
 	// Cross detection initialization tracking
 	EMA9EMA21StateInitialized bool // True once we've seen at least one position state (prevents false crosses on startup)
 
+	// OANDA Real-time P/L tracking (fetched from OANDA API)
+	OandaUnrealizedPL string // Current unrealized P/L from OANDA (e.g., "-2.45")
+	OandaRealizedPL   string // Realized P/L when position was closed
+
 	// Track which entry conditions have been completed
 	EntryConditionsCompleted map[string]bool // Maps condition index to completion status
 
 	// Track which exit conditions have been completed
 	ExitConditionsCompleted map[string]bool // Maps condition index to completion status
+
+	// Whipsaw protection
+	LastClosedDirection string // Tracks the last direction that was closed (for reversal logic)
 }
 
 // Global state management
@@ -252,6 +261,13 @@ var (
 	tradingDays           []int          // Days of week when trading is allowed (0=Sunday, 1=Monday, ...6=Saturday)
 	tradingTimezone       *time.Location // Timezone for trading hours (default: uses timezoneOffset)
 	wasWithinTradingHours bool           // Track last known trading hours state to detect when hours open
+
+	// Daily profit tracking
+	dailyProfitTarget        float64   // Target profit for the day (disables trading when reached)
+	dailyProfitTargetEnabled bool      // Whether daily profit limit is enabled
+	dailyRealizedProfit      float64   // Total realized profit for today
+	dailyProfitResetTime     time.Time // When the daily profit counter was last reset
+	dailyProfitTargetReached bool      // Flag indicating daily target has been reached
 )
 
 // Get or create position state for a symbol
@@ -314,6 +330,11 @@ func updateLatestPrice(symbol string, price string) {
 			log.Printf("💰 [%s] %s %s @ %s | P/L: %s %s$%.5f / %s%.2f%%",
 				symbol, strings.ToUpper(state.Position), state.Exchange, price,
 				plColor, plSign, plDollars, plSign, plPercent)
+		}
+
+		// For real OANDA positions, update P/L in background
+		if state.PositionOpen && !state.IsSimulated && state.TradeID != "" {
+			go updateOandaPositionPL(symbol)
 		}
 	}
 }
@@ -1295,6 +1316,8 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.ATRLong
 	case "/webhook/atr/short":
 		return state.ATRShort
+	case "/webhook/atr/idle":
+		return state.ATRIdle
 
 	// SMC (Smart Money Concept) structure conditions
 	case "/webhook/smc/low-low":
@@ -1318,8 +1341,15 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 	// Check if strategy is enabled first
 	mu.RLock()
 	enabled := strategyEnabled
+	targetReached := dailyProfitTargetReached
 	mu.RUnlock()
 	if !enabled {
+		return false
+	}
+
+	// Check if daily profit target has been reached
+	if dailyProfitTargetEnabled && targetReached {
+		log.Printf("🎯 [DAILY] Daily profit target reached - new positions blocked")
 		return false
 	}
 
@@ -2941,50 +2971,71 @@ func handleATRLong(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Check if this is a real cross by comparing with the opposite state
-	// ATR was short direction, now long = cross detected
-	// Only count as cross if state was initialized AND opposite direction was true
-	wasCross := state.ATRDirectionInitialized && !state.ATRDirectionLong
+	// Check previous state for cross detection
+	wasShort := state.ATRShort
+	wasLong := state.ATRLong
+	wasIdle := state.ATRIdle
+	wasInitialized := state.ATRLong || state.ATRShort || state.ATRIdle
 
-	log.Printf("📊 ATR long signal for %s (wasCross=%v, initialized=%v, wasLong=%v)",
-		symbol, wasCross, state.ATRDirectionInitialized, state.ATRDirectionLong)
+	// Cross = any state change (short→long OR idle→long)
+	isCross := wasShort || wasIdle
+
+	log.Printf("📊 ATR long signal for %s (wasShort=%v, wasLong=%v, wasIdle=%v, initialized=%v, isCross=%v)",
+		symbol, wasShort, wasLong, wasIdle, wasInitialized, isCross)
 
 	mu.Lock()
 	state.ATRLong = true
 	state.ATRShort = false
-	state.ATRDirectionLong = true
-	state.ATRDirectionInitialized = true
-	// Only set crossed flag if this was an actual cross
-	if wasCross {
+	state.ATRIdle = false
+	if isCross {
 		state.ATRLongCrossed = true
 		state.ATRShortCrossed = false
+		// Clear the idle-opened flag on direction change - position will be evaluated for exit
+		state.PositionOpenedWhileIdle = false
 	}
 	mu.Unlock()
 
-	// Check if we should exit SHORT position (ATR long = exit short) - only on real cross
-	if wasCross && state.PositionOpen && state.Position == "short" {
+	// First signal after startup/reset - initialize only, no trade
+	if !wasInitialized {
+		log.Printf("⏳ [INIT] First ATR signal - initializing as LONG, waiting for next cross")
+		respondSuccess(w, "ATR long initialized - waiting for cross")
+		return
+	}
+
+	// Repeated signal - no state change, no action
+	if wasLong {
+		log.Printf("ℹ️  [LONG→LONG] Already in long state - no change")
+		respondSuccess(w, "ATR long condition maintained")
+		return
+	}
+
+	// Cross detected (from short or idle)
+	if wasShort {
+		log.Printf("✅ [SHORT→LONG] Cross detected")
+	} else if wasIdle {
+		log.Printf("✅ [IDLE→LONG] Cross detected")
+	}
+
+	// Check if we should exit SHORT position
+	if state.PositionOpen && state.Position == "short" {
 		shouldExit, reason := shouldExitPosition(symbol, false, r)
 		if shouldExit {
 			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
 			closePosition(symbol)
-			respondSuccess(w, "ATR long → SHORT closed")
+			respondSuccess(w, "ATR long cross → SHORT closed")
 			return
 		}
 	}
 
-	// Check if we should open LONG position (ATR long = enter long) - only on real cross
-	if wasCross && !state.PositionOpen && shouldOpenPosition(symbol, true, r) {
-		log.Printf("✅ [TRADE] ATR crossed to long + strategy conditions met! Opening LONG position")
+	// Check if we should open LONG position
+	if !state.PositionOpen && shouldOpenPosition(symbol, true, r) {
+		log.Printf("✅ [TRADE] ATR long cross + strategy conditions met! Opening LONG position")
 		openLongPosition(symbol, event.Close)
-		respondSuccess(w, "ATR long → LONG opened")
+		respondSuccess(w, "ATR long cross → LONG opened")
 		return
 	}
 
-	if !state.ATRDirectionInitialized || !wasCross {
-		log.Printf("⏳ [INIT] ATR long - state initialized, waiting for next cross to trigger")
-	}
-
-	respondSuccess(w, "ATR long condition set")
+	respondSuccess(w, "ATR long cross condition set")
 }
 
 // POST /webhook/atr/short
@@ -3015,50 +3066,173 @@ func handleATRShort(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Check if this is a real cross by comparing with the opposite state
-	// ATR was long direction, now short = cross detected
-	// Only count as cross if state was initialized AND opposite direction was true
-	wasCross := state.ATRDirectionInitialized && state.ATRDirectionLong
+	// Check previous state for cross detection
+	wasLong := state.ATRLong
+	wasShort := state.ATRShort
+	wasIdle := state.ATRIdle
+	wasInitialized := state.ATRLong || state.ATRShort || state.ATRIdle
 
-	log.Printf("📊 ATR short signal for %s (wasCross=%v, initialized=%v, wasLong=%v)",
-		symbol, wasCross, state.ATRDirectionInitialized, state.ATRDirectionLong)
+	// Cross = any state change (long→short OR idle→short)
+	isCross := wasLong || wasIdle
+
+	log.Printf("📊 ATR short signal for %s (wasLong=%v, wasShort=%v, wasIdle=%v, initialized=%v, isCross=%v)",
+		symbol, wasLong, wasShort, wasIdle, wasInitialized, isCross)
 
 	mu.Lock()
 	state.ATRShort = true
 	state.ATRLong = false
-	state.ATRDirectionLong = false
-	state.ATRDirectionInitialized = true
-	// Only set crossed flag if this was an actual cross
-	if wasCross {
+	state.ATRIdle = false
+	if isCross {
 		state.ATRShortCrossed = true
 		state.ATRLongCrossed = false
+		// Clear the idle-opened flag on direction change - position will be evaluated for exit
+		state.PositionOpenedWhileIdle = false
 	}
 	mu.Unlock()
 
-	// Check if we should exit LONG position (ATR short = exit long) - only on real cross
-	if wasCross && state.PositionOpen && state.Position == "long" {
+	// First signal after startup/reset - initialize only, no trade
+	if !wasInitialized {
+		log.Printf("⏳ [INIT] First ATR signal - initializing as SHORT, waiting for next cross")
+		respondSuccess(w, "ATR short initialized - waiting for cross")
+		return
+	}
+
+	// Repeated signal - no state change, no action
+	if wasShort {
+		log.Printf("ℹ️  [SHORT→SHORT] Already in short state - no change")
+		respondSuccess(w, "ATR short condition maintained")
+		return
+	}
+
+	// Cross detected (from long or idle)
+	if wasLong {
+		log.Printf("✅ [LONG→SHORT] Cross detected")
+	} else if wasIdle {
+		log.Printf("✅ [IDLE→SHORT] Cross detected")
+	}
+
+	// Check if we should exit LONG position
+	if state.PositionOpen && state.Position == "long" {
 		shouldExit, reason := shouldExitPosition(symbol, true, r)
 		if shouldExit {
 			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
 			closePosition(symbol)
-			respondSuccess(w, "ATR short → LONG closed")
+			respondSuccess(w, "ATR short cross → LONG closed")
 			return
 		}
 	}
 
-	// Check if we should open SHORT position (ATR short = enter short) - only on real cross
-	if wasCross && !state.PositionOpen && shouldOpenPosition(symbol, false, r) {
-		log.Printf("✅ [TRADE] ATR crossed to short + strategy conditions met! Opening SHORT position")
+	// Check if we should open SHORT position
+	if !state.PositionOpen && shouldOpenPosition(symbol, false, r) {
+		log.Printf("✅ [TRADE] ATR short cross + strategy conditions met! Opening SHORT position")
 		openShortPosition(symbol, event.Close)
-		respondSuccess(w, "ATR short → SHORT opened")
+		respondSuccess(w, "ATR short cross → SHORT opened")
 		return
 	}
 
-	if !state.ATRDirectionInitialized || !wasCross {
-		log.Printf("⏳ [INIT] ATR short - state initialized, waiting for next cross to trigger")
+	respondSuccess(w, "ATR short cross condition set")
+}
+
+// POST /webhook/atr/idle
+// ATR Idle signal - ATR direction conflicts with long-term trend (1H 200 EMA)
+// This closes any open position and prevents new trades until Long or Short fires again
+func handleATRIdle(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/idle") {
+		log.Printf("⏭️  [WEBHOOK] ATR Idle not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
 	}
 
-	respondSuccess(w, "ATR short condition set")
+	log.Printf("🔔 [WEBHOOK] Received ATR Idle event (trend conflict)")
+
+	// Sync positions from OANDA to detect externally opened positions before deciding
+	if err := periodicSyncPositionsFromOanda(); err != nil {
+		log.Printf("⚠️  [SYNC] Failed to sync positions: %v", err)
+	}
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Check previous state for cross detection
+	wasLong := state.ATRLong
+	wasShort := state.ATRShort
+	wasIdle := state.ATRIdle
+	wasInitialized := state.ATRLong || state.ATRShort || state.ATRIdle
+
+	// Cross = any state change (long→idle OR short→idle)
+	isCross := wasLong || wasShort
+
+	log.Printf("⚠️  ATR Idle for %s (wasLong=%v, wasShort=%v, wasIdle=%v, initialized=%v, isCross=%v)",
+		symbol, wasLong, wasShort, wasIdle, wasInitialized, isCross)
+
+	// Set idle state
+	mu.Lock()
+	state.ATRIdle = true
+	state.ATRLong = false
+	state.ATRShort = false
+	state.ATRFlipLong = false
+	state.ATRFlipShort = false
+	state.ATRLongCrossed = false
+	state.ATRShortCrossed = false
+	mu.Unlock()
+
+	// First signal after startup/reset - initialize only, no action
+	if !wasInitialized {
+		log.Printf("⏳ [INIT] First ATR signal - initializing as IDLE, waiting for next cross")
+		respondSuccess(w, "ATR idle initialized - waiting for cross")
+		return
+	}
+
+	// Repeated signal - no state change, no action
+	if wasIdle {
+		log.Printf("ℹ️  [IDLE→IDLE] Already in idle state - no change")
+		respondSuccess(w, "ATR idle condition maintained")
+		return
+	}
+
+	// Cross detected (from long or short) - close any open position
+	if wasLong {
+		log.Printf("✅ [LONG→IDLE] Cross detected - trend conflict")
+	} else if wasShort {
+		log.Printf("✅ [SHORT→IDLE] Cross detected - trend conflict")
+	}
+
+	if state.PositionOpen {
+		// Check if position was opened externally during idle - let it ride until next ATR direction change
+		if state.PositionOpenedWhileIdle {
+			log.Printf("ℹ️  [IDLE] Position was opened externally during idle - letting it ride until next ATR cross")
+			respondSuccess(w, "ATR idle - external position waiting for next cross")
+			return
+		}
+		posType := state.Position
+		log.Println(strings.Repeat("⚪", 40))
+		log.Printf("⚪ ATR IDLE - Trend conflict detected!")
+		log.Printf("⚪ Closing %s position for %s", strings.ToUpper(posType), symbol)
+		log.Printf("⚪ Will stay FLAT until ATR Long or ATR Short fires")
+		log.Println(strings.Repeat("⚪", 40))
+		closePosition(symbol)
+		respondSuccess(w, fmt.Sprintf("ATR idle cross → %s closed, staying flat", strings.ToUpper(posType)))
+		return
+	}
+
+	log.Printf("ℹ️  [IDLE] No open position - staying flat until trend aligns")
+
+	respondSuccess(w, "ATR idle cross - no trading until Long or Short fires")
 }
 
 // ============================================================================
@@ -5934,6 +6108,252 @@ func getCurrentPrice(symbol string) (float64, error) {
 	return price, nil
 }
 
+// Get unrealized P/L for an open trade from OANDA
+// Returns the unrealized P/L in account currency (typically USD)
+func getOandaTradeUnrealizedPL(tradeID string) (float64, error) {
+	if tradeID == "" {
+		return 0, fmt.Errorf("no trade ID provided")
+	}
+
+	url := fmt.Sprintf("%s/v3/accounts/%s/trades/%s", oandaBaseURL, oandaAccountID, tradeID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch trade: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("OANDA API returned status %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	trade, ok := result["trade"].(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("invalid trade data")
+	}
+
+	// OANDA returns unrealizedPL as a string
+	unrealizedPLStr, ok := trade["unrealizedPL"].(string)
+	if !ok {
+		return 0, fmt.Errorf("no unrealized P/L in response")
+	}
+
+	unrealizedPL := 0.0
+	fmt.Sscanf(unrealizedPLStr, "%f", &unrealizedPL)
+	return unrealizedPL, nil
+}
+
+// Get realized P/L from a closed trade (used when position is closed)
+func getOandaTradeRealizedPL(tradeID string) (float64, error) {
+	if tradeID == "" {
+		return 0, fmt.Errorf("no trade ID provided")
+	}
+
+	// Query the transactions endpoint to find the close transaction
+	url := fmt.Sprintf("%s/v3/accounts/%s/transactions", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Get recent transactions
+	q := req.URL.Query()
+	q.Add("count", "100")
+	req.URL.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch transactions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("OANDA API returned status %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	transactions, ok := result["transactions"].([]interface{})
+	if !ok {
+		return 0, fmt.Errorf("no transactions found")
+	}
+
+	// Look for ORDER_FILL transaction that closed this trade
+	for _, txn := range transactions {
+		txnMap, ok := txn.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Check if this transaction involves our trade
+		if tradesClosed, ok := txnMap["tradesClosed"].([]interface{}); ok {
+			for _, closedTrade := range tradesClosed {
+				closedTradeMap, ok := closedTrade.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if closedTradeMap["tradeID"] == tradeID {
+					// Found the close transaction for our trade
+					if realizedPLStr, ok := closedTradeMap["realizedPL"].(string); ok {
+						realizedPL := 0.0
+						fmt.Sscanf(realizedPLStr, "%f", &realizedPL)
+						return realizedPL, nil
+					}
+				}
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("could not find close transaction for trade %s", tradeID)
+}
+
+// Update position state with real-time P/L from OANDA
+// Called on webhook events to refresh P/L data
+func updateOandaPositionPL(symbol string) {
+	mu.RLock()
+	state, exists := positions[symbol]
+	if !exists || !state.PositionOpen || state.IsSimulated || state.TradeID == "" {
+		mu.RUnlock()
+		return
+	}
+	tradeID := state.TradeID
+	mu.RUnlock()
+
+	unrealizedPL, err := getOandaTradeUnrealizedPL(tradeID)
+	if err != nil {
+		log.Printf("⚠️  [P/L] Failed to fetch P/L for %s (ID: %s): %v", symbol, tradeID, err)
+		return
+	}
+
+	mu.Lock()
+	state.OandaUnrealizedPL = fmt.Sprintf("%.2f", unrealizedPL)
+	mu.Unlock()
+
+	// Log P/L update
+	plColor := "🟢"
+	plSign := "+"
+	if unrealizedPL < 0 {
+		plColor = "🔴"
+		plSign = ""
+	}
+	log.Printf("💰 [OANDA P/L] %s %s: %s%s$%.2f", plColor, symbol, plSign, "", unrealizedPL)
+}
+
+// Get all open positions with their P/L from OANDA
+// Returns a map of symbol -> P/L details
+func getOandaOpenPositionsPL() map[string]map[string]interface{} {
+	result := make(map[string]map[string]interface{})
+
+	url := fmt.Sprintf("%s/v3/accounts/%s/openTrades", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("⚠️  [P/L] Failed to fetch open trades: %v", err)
+		return result
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("⚠️  [P/L] OANDA API returned status %d", resp.StatusCode)
+		return result
+	}
+
+	var apiResult map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResult); err != nil {
+		log.Printf("⚠️  [P/L] Failed to parse response: %v", err)
+		return result
+	}
+
+	trades, ok := apiResult["trades"].([]interface{})
+	if !ok {
+		return result
+	}
+
+	for _, trade := range trades {
+		tradeMap, ok := trade.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		instrument, _ := tradeMap["instrument"].(string)
+		if instrument == "" {
+			continue
+		}
+
+		result[instrument] = map[string]interface{}{
+			"tradeID":       tradeMap["id"],
+			"unrealizedPL":  tradeMap["unrealizedPL"],
+			"currentUnits":  tradeMap["currentUnits"],
+			"price":         tradeMap["price"],
+			"openTime":      tradeMap["openTime"],
+			"initialMargin": tradeMap["initialMarginRequired"],
+		}
+	}
+
+	return result
+}
+
+// Check if daily profit target has been reached and disable trading if so
+func checkDailyProfitTarget() {
+	if !dailyProfitTargetEnabled || dailyProfitTargetReached {
+		return
+	}
+
+	// Check if we need to reset the daily counter (new day)
+	now := getLocalTime()
+	if now.YearDay() != dailyProfitResetTime.YearDay() || now.Year() != dailyProfitResetTime.Year() {
+		mu.Lock()
+		dailyRealizedProfit = 0
+		dailyProfitTargetReached = false
+		dailyProfitResetTime = now
+		mu.Unlock()
+		log.Printf("🔄 [DAILY] New trading day - daily profit counter reset to $0.00")
+	}
+
+	if dailyRealizedProfit >= dailyProfitTarget {
+		mu.Lock()
+		dailyProfitTargetReached = true
+		strategyEnabled = false
+		mu.Unlock()
+		log.Println(strings.Repeat("💰", 40))
+		log.Printf("🎯 [DAILY PROFIT] Target reached! Today's profit: $%.2f (Target: $%.2f)", dailyRealizedProfit, dailyProfitTarget)
+		log.Printf("🛑 [DAILY PROFIT] Trading DISABLED for the rest of the day")
+		log.Printf("   Re-enable manually via /enable-strategy or wait for new trading day")
+		log.Println(strings.Repeat("💰", 40))
+	}
+}
+
+// Add realized profit to daily total (called when position is closed)
+func addDailyRealizedProfit(profit float64) {
+	mu.Lock()
+	dailyRealizedProfit += profit
+	mu.Unlock()
+
+	log.Printf("💵 [DAILY] Added $%.2f to daily profit. Today's total: $%.2f", profit, dailyRealizedProfit)
+
+	// Check if target reached
+	checkDailyProfitTarget()
+}
+
 // Calculate units from USD amount
 func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	log.Printf("💱 [CALCULATE] Converting $%.2f USD to units for %s", usdAmount, symbol)
@@ -5962,8 +6382,9 @@ func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 
 // Calculate price move needed to achieve a specific dollar amount P&L
 // Accounts for currency conversion factors from OANDA
-func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDollars float64, units int, isLong bool) (float64, error) {
+func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDollars float64, units int, isGain bool) (float64, error) {
 	// Get pricing info from OANDA which includes homeConversionFactors
+	// isGain: true for take profit (use gainQuoteHome), false for stop loss (use lossQuoteHome)
 	url := fmt.Sprintf("%s/v3/accounts/%s/pricing?instruments=%s", oandaBaseURL, oandaAccountID, symbol)
 
 	req, _ := http.NewRequest("GET", url, nil)
@@ -5998,11 +6419,11 @@ func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDol
 		return targetDollars / float64(units), nil
 	}
 
-	// For LONG positions, we use gainQuoteHome (quote currency gain -> home currency)
-	// For SHORT positions, we use lossQuoteHome (quote currency gain -> home currency)
-	// These account for the current exchange rates
+	// For gains (take profit), we use gainQuoteHome (converts positive P&L to home currency)
+	// For losses (stop loss), we use lossQuoteHome (converts negative P&L to home currency)
+	// These account for the current exchange rates and bid/ask spread
 	var conversionFactor float64
-	if isLong {
+	if isGain {
 		gainFactorStr, ok := homeConversion["gainQuoteHome"].(string)
 		if ok {
 			fmt.Sscanf(gainFactorStr, "%f", &conversionFactor)
@@ -6042,7 +6463,8 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, un
 		fmt.Sscanf(takeProfitDollars, "%f", &dollars)
 
 		// Query OANDA for accurate conversion factor
-		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, isLong)
+		// Take profit is always a gain, so use isGain=true to get gainQuoteHome factor
+		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, true)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get accurate conversion, using simple calculation: %v", err)
 			// Fallback to simple calculation (works for XXX_USD pairs)
@@ -6121,7 +6543,8 @@ func calculateStopLossPrice(symbol string, entryPrice float64, isLong bool, unit
 		fmt.Sscanf(stopLossDollars, "%f", &dollars)
 
 		// Query OANDA for accurate conversion factor
-		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, !isLong)
+		// Stop loss is always a loss, so use isGain=false to get lossQuoteHome factor
+		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, false)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get accurate conversion, using simple calculation: %v", err)
 			// Fallback to simple calculation (works for XXX_USD pairs)
@@ -6428,6 +6851,84 @@ func queryTradeCloseReason(tradeID string) (string, error) {
 	return "UNKNOWN", nil
 }
 
+// queryTradeCloseDetails returns both the close reason and the realized P/L for a closed trade
+func queryTradeCloseDetails(tradeID string) (reason string, realizedPL float64, err error) {
+	// Get recent transactions for this account
+	url := fmt.Sprintf("%s/v3/accounts/%s/transactions", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	q := req.URL.Query()
+	q.Add("count", "100")
+	req.URL.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "UNKNOWN", 0, fmt.Errorf("failed to fetch transactions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "UNKNOWN", 0, fmt.Errorf("failed to parse transactions: %v", err)
+	}
+
+	transactions, ok := result["transactions"].([]interface{})
+	if !ok {
+		return "UNKNOWN", 0, fmt.Errorf("no transactions found")
+	}
+
+	// Look for the ORDER_FILL transaction that closed this trade
+	for i := len(transactions) - 1; i >= 0; i-- {
+		txn, ok := transactions[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		txnType, _ := txn["type"].(string)
+		if txnType != "ORDER_FILL" {
+			continue
+		}
+
+		tradesClosed, ok := txn["tradesClosed"].([]interface{})
+		if !ok || len(tradesClosed) == 0 {
+			continue
+		}
+
+		for _, tc := range tradesClosed {
+			tcMap, ok := tc.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			closedTradeID, _ := tcMap["tradeID"].(string)
+			if closedTradeID == tradeID {
+				// Found the close transaction
+				txnReason, _ := txn["reason"].(string)
+
+				// Get realized P/L from the trade close details
+				if plStr, ok := tcMap["realizedPL"].(string); ok {
+					fmt.Sscanf(plStr, "%f", &realizedPL)
+				}
+
+				// Determine close reason
+				if txnReason == "TAKE_PROFIT_ORDER" || strings.Contains(txnReason, "TAKE_PROFIT") {
+					return "TAKE_PROFIT", realizedPL, nil
+				} else if txnReason == "STOP_LOSS_ORDER" || strings.Contains(txnReason, "STOP_LOSS") {
+					return "STOP_LOSS", realizedPL, nil
+				} else {
+					return "MANUAL", realizedPL, nil
+				}
+			}
+		}
+	}
+
+	return "UNKNOWN", 0, nil
+}
+
 // Check if any bot positions have been closed by OANDA (TP/SL hit)
 func checkClosedPositions() {
 	mu.RLock()
@@ -6487,11 +6988,16 @@ func checkClosedPositions() {
 	// Check if any bot positions are no longer in OANDA
 	for _, botTrade := range botOpenTrades {
 		if !oandaTradeIDs[botTrade.tradeID] {
-			// Trade was closed by OANDA - determine why
-			closeReason, err := queryTradeCloseReason(botTrade.tradeID)
+			// Trade was closed by OANDA - get close reason and realized P/L
+			closeReason, realizedPL, err := queryTradeCloseDetails(botTrade.tradeID)
 			if err != nil {
-				log.Printf("⚠️  [CHECK] Could not determine close reason for %s: %v", botTrade.tradeID, err)
+				log.Printf("⚠️  [CHECK] Could not determine close details for %s: %v", botTrade.tradeID, err)
 				closeReason = "UNKNOWN"
+			}
+
+			// Track daily profit if enabled
+			if dailyProfitTargetEnabled && realizedPL != 0 {
+				addDailyRealizedProfit(realizedPL)
 			}
 
 			mu.Lock()
@@ -6502,6 +7008,7 @@ func checkClosedPositions() {
 			state.PositionOpen = false
 			state.Position = ""
 			state.TradeID = ""
+			state.OandaRealizedPL = fmt.Sprintf("%.2f", realizedPL)
 			state.EntryConditionsCompleted = make(map[string]bool)
 			state.ExitConditionsCompleted = make(map[string]bool)
 			resetIndicatorStates(state)
@@ -6517,12 +7024,20 @@ func checkClosedPositions() {
 			mu.Unlock()
 
 			// Log based on closure reason
+			plColor := "🟢"
+			plSign := "+"
+			if realizedPL < 0 {
+				plColor = "🔴"
+				plSign = ""
+			}
+
 			if closeReason == "TAKE_PROFIT" {
 				log.Println(strings.Repeat("🎯", 40))
 				log.Printf("🎯 TAKE PROFIT HIT - %s %s", strings.ToUpper(positionType), botTrade.symbol)
 				log.Println(strings.Repeat("🎯", 40))
 				log.Printf("Trade ID: %s", botTrade.tradeID)
 				log.Printf("Target: $%s profit", takeProfitDollars)
+				log.Printf("💰 Realized P/L: %s %s$%.2f", plColor, plSign, realizedPL)
 				log.Println(strings.Repeat("🎯", 40))
 				log.Printf("✅ Position closed automatically by OANDA")
 			} else if closeReason == "STOP_LOSS" {
@@ -6531,11 +7046,12 @@ func checkClosedPositions() {
 				log.Println(strings.Repeat("🛑", 40))
 				log.Printf("Trade ID: %s", botTrade.tradeID)
 				log.Printf("Loss limit: $%s", stopLossDollars)
+				log.Printf("💰 Realized P/L: %s %s$%.2f", plColor, plSign, realizedPL)
 				log.Println(strings.Repeat("🛑", 40))
 				log.Printf("✅ Position closed automatically by OANDA")
 			} else {
-				log.Printf("ℹ️  [SYNC] Position closed in OANDA: %s %s (ID: %s, Reason: %s)",
-					strings.ToUpper(positionType), botTrade.symbol, botTrade.tradeID, closeReason)
+				log.Printf("ℹ️  [SYNC] Position closed in OANDA: %s %s (ID: %s, Reason: %s, P/L: %s%s$%.2f)",
+					strings.ToUpper(positionType), botTrade.symbol, botTrade.tradeID, closeReason, plSign, "", realizedPL)
 			}
 
 			log.Printf("💾 [STATE] Position updated - Open=false, Type='', TradeID='', Flags cleared")
@@ -6744,7 +7260,7 @@ func syncPositionsFromOandaWithLogging(verbose bool) error {
 		state, exists := positions[instrument]
 		if !exists {
 			// Create new state for this instrument
-			positions[instrument] = &PositionState{
+			newState := &PositionState{
 				Symbol:                   instrument,
 				PositionOpen:             true,
 				Position:                 pos.positionType,
@@ -6752,6 +7268,7 @@ func syncPositionsFromOandaWithLogging(verbose bool) error {
 				EntryConditionsCompleted: make(map[string]bool),
 				ExitConditionsCompleted:  make(map[string]bool),
 			}
+			positions[instrument] = newState
 			log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA: %s %s (ID: %s, Units: %s)",
 				strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
 		} else if !state.PositionOpen {
@@ -6760,14 +7277,28 @@ func syncPositionsFromOandaWithLogging(verbose bool) error {
 			state.Position = pos.positionType
 			state.TradeID = pos.tradeID
 			state.PositionOpening = false
-			log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA: %s %s (ID: %s, Units: %s)",
-				strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
+			// If ATR is currently idle, mark this position as opened during idle
+			// so it won't be closed by subsequent idle signals - wait for ATR cross
+			if state.ATRIdle {
+				state.PositionOpenedWhileIdle = true
+				log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA during ATR IDLE: %s %s (ID: %s, Units: %s)",
+					strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
+				log.Printf("   💡 Position will be held until next ATR direction change (long/short cross)")
+			} else {
+				log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA: %s %s (ID: %s, Units: %s)",
+					strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
+			}
 		} else if state.TradeID != pos.tradeID {
 			// Different trade ID - position was closed and reopened
 			log.Printf("🔔 [SYNC] Detected position REPLACED in OANDA: %s %s (Old ID: %s → New ID: %s)",
 				strings.ToUpper(pos.positionType), instrument, state.TradeID, pos.tradeID)
 			state.TradeID = pos.tradeID
 			state.Position = pos.positionType
+			// If ATR is idle, mark as opened during idle
+			if state.ATRIdle {
+				state.PositionOpenedWhileIdle = true
+				log.Printf("   💡 Position replaced during ATR IDLE - will be held until next ATR direction change")
+			}
 		}
 	}
 
@@ -7233,10 +7764,29 @@ func closePosition(symbol string) {
 
 	log.Printf("📥 [OANDA] Response status: %d", resp.StatusCode)
 
+	// Parse response to extract realized P/L
+	var responseBody map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&responseBody)
+
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Extract realized P/L from OANDA response
+		var realizedPL float64
+		if orderFillTxn, ok := responseBody["orderFillTransaction"].(map[string]interface{}); ok {
+			if plStr, ok := orderFillTxn["pl"].(string); ok {
+				fmt.Sscanf(plStr, "%f", &realizedPL)
+				log.Printf("💰 [OANDA] Realized P/L: $%.2f", realizedPL)
+
+				// Track daily profit
+				if dailyProfitTargetEnabled {
+					addDailyRealizedProfit(realizedPL)
+				}
+			}
+		}
+
 		mu.Lock()
 		state.PositionOpen = false
 		state.Position = "none"
+		state.OandaRealizedPL = fmt.Sprintf("%.2f", realizedPL)
 		state.TradeID = ""
 		// Clear exit tracking but KEEP entry condition states (don't clear indicator flags)
 		state.ExitConditionsCompleted = make(map[string]bool)
@@ -7261,9 +7811,6 @@ func closePosition(symbol string) {
 			log.Printf("🛑 [STRATEGY] Strategy DISABLED after completing trade (oneTradeMode=true) - re-enable via /enable-strategy")
 		}
 	} else {
-		// Read response body for error details
-		var responseBody map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&responseBody)
 		log.Printf("❌ Failed to close position (status %d)", resp.StatusCode)
 		log.Printf("📄 [RESPONSE] %+v", responseBody)
 	}
@@ -7459,15 +8006,22 @@ func checkTradingHoursTransition() {
 		log.Printf("   New positions now allowed. Waiting for fresh entry signals...")
 		log.Printf(strings.Repeat("=", 80) + "\n")
 
-		// Reset ATR direction state so first signal initializes, second signal triggers
+		// Reset ALL ATR state so first signal initializes, second signal triggers
+		// This prevents whipsaw trading when hours open with stale state
 		mu.Lock()
 		for _, state := range positions {
+			// Reset direction tracking (for flip detection)
 			state.ATRDirectionInitialized = false
 			state.ATRFlipLong = false
 			state.ATRFlipShort = false
+			// Reset ATR state (for idle-aware long/short)
+			// This ensures first signal after hours open is treated as initialization
+			state.ATRLong = false
+			state.ATRShort = false
+			state.ATRIdle = false
 			state.ATRLongCrossed = false
 			state.ATRShortCrossed = false
-			log.Printf("   🔄 Reset ATR direction state for %s", state.Symbol)
+			log.Printf("   🔄 Reset ATR state for %s (will wait for fresh cross)", state.Symbol)
 		}
 		mu.Unlock()
 	}
@@ -7498,15 +8052,36 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 func statusHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
 	enabled := strategyEnabled
+	dailyProfit := dailyRealizedProfit
+	dailyTarget := dailyProfitTarget
+	dailyTargetEnabled := dailyProfitTargetEnabled
+	dailyTargetReached := dailyProfitTargetReached
 	mu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	// Fetch real-time P/L from OANDA for open positions
+	oandaPL := getOandaOpenPositionsPL()
+
+	// Build response with enhanced P/L data
+	response := map[string]interface{}{
 		"positions":       positions,
 		"strategyEnabled": enabled,
 		"oneTradeMode":    activeStrategy.OneTradeMode,
 		"strategyName":    activeStrategy.Name,
-	})
+		"oandaPositions":  oandaPL,
+	}
+
+	// Add daily profit tracking if enabled
+	if dailyTargetEnabled {
+		response["dailyProfit"] = map[string]interface{}{
+			"realized":      fmt.Sprintf("%.2f", dailyProfit),
+			"target":        fmt.Sprintf("%.2f", dailyTarget),
+			"targetReached": dailyTargetReached,
+			"remaining":     fmt.Sprintf("%.2f", dailyTarget-dailyProfit),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // Enable strategy after manual intervention
@@ -7536,6 +8111,62 @@ func disableStrategyHandler(w http.ResponseWriter, r *http.Request) {
 		"success":         true,
 		"strategyEnabled": false,
 		"message":         "Strategy disabled",
+	})
+}
+
+// GET /daily-profit - Get current daily profit stats
+func dailyProfitHandler(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	dailyProfit := dailyRealizedProfit
+	dailyTarget := dailyProfitTarget
+	dailyTargetEnabled := dailyProfitTargetEnabled
+	dailyTargetReached := dailyProfitTargetReached
+	resetTime := dailyProfitResetTime
+	mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if !dailyTargetEnabled {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": false,
+			"message": "Daily profit target not configured. Set DAILY_PROFIT_TARGET env var.",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":         true,
+		"realized":        fmt.Sprintf("%.2f", dailyProfit),
+		"target":          fmt.Sprintf("%.2f", dailyTarget),
+		"remaining":       fmt.Sprintf("%.2f", dailyTarget-dailyProfit),
+		"targetReached":   dailyTargetReached,
+		"resetTime":       resetTime.Format(time.RFC3339),
+		"percentOfTarget": fmt.Sprintf("%.1f%%", (dailyProfit/dailyTarget)*100),
+	})
+}
+
+// POST /reset-daily-profit - Reset daily profit counter
+func resetDailyProfitHandler(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	dailyRealizedProfit = 0
+	dailyProfitTargetReached = false
+	dailyProfitResetTime = getLocalTime()
+
+	// Also re-enable strategy if it was disabled due to daily target
+	if dailyProfitTargetEnabled {
+		strategyEnabled = true
+	}
+	mu.Unlock()
+
+	log.Printf("🔄 [DAILY] Daily profit counter manually reset to $0.00")
+	log.Printf("✅ [STRATEGY] Strategy re-enabled")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"message":         "Daily profit reset to $0.00 and strategy re-enabled",
+		"strategyEnabled": true,
+		"dailyProfit":     "0.00",
 	})
 }
 
@@ -7907,6 +8538,19 @@ func main() {
 	stopLossPct = os.Getenv("STOP_LOSS_PCT")
 	stopLossDollars = os.Getenv("STOP_LOSS_DOLLARS")
 
+	// Daily profit target configuration
+	dailyProfitTargetStr := os.Getenv("DAILY_PROFIT_TARGET")
+	if dailyProfitTargetStr != "" {
+		if target, err := strconv.ParseFloat(dailyProfitTargetStr, 64); err == nil && target > 0 {
+			dailyProfitTarget = target
+			dailyProfitTargetEnabled = true
+			dailyProfitResetTime = getLocalTime()
+			log.Printf("🎯 Daily Profit Target: $%.2f (trading will stop when reached)", dailyProfitTarget)
+		} else {
+			log.Printf("⚠️  Invalid DAILY_PROFIT_TARGET value '%s', feature disabled", dailyProfitTargetStr)
+		}
+	}
+
 	// Strategy configuration
 	strategyName = os.Getenv("STRATEGY_FILE")
 	if strategyName == "" {
@@ -8123,12 +8767,17 @@ func main() {
 	if tradingHoursEnabled {
 		wasWithinTradingHours = isWithinTradingHours()
 		if wasWithinTradingHours {
-			log.Printf("🔄 [STARTUP] Trading hours OPEN - resetting ATR direction state for fresh signals")
+			log.Printf("🔄 [STARTUP] Trading hours OPEN - resetting ATR state for fresh signals")
 			mu.Lock()
 			for _, state := range positions {
+				// Reset direction tracking (for flip detection)
 				state.ATRDirectionInitialized = false
 				state.ATRFlipLong = false
 				state.ATRFlipShort = false
+				// Reset ATR state (for idle-aware long/short)
+				state.ATRLong = false
+				state.ATRShort = false
+				state.ATRIdle = false
 				state.ATRLongCrossed = false
 				state.ATRShortCrossed = false
 			}
@@ -8153,6 +8802,8 @@ func main() {
 	http.HandleFunc("/status", statusHandler)
 	http.HandleFunc("/enable-strategy", enableStrategyHandler)
 	http.HandleFunc("/disable-strategy", disableStrategyHandler)
+	http.HandleFunc("/daily-profit", dailyProfitHandler)
+	http.HandleFunc("/reset-daily-profit", resetDailyProfitHandler)
 
 	// RSI Specific Level Webhooks
 	http.HandleFunc("/webhook/rsi/cross-up-oversell-25", handleRSICrossUpOversell25)
@@ -8174,6 +8825,7 @@ func main() {
 	http.HandleFunc("/webhook/atr/flip-short", handleATRFlipShort)
 	http.HandleFunc("/webhook/atr/long", handleATRLong)
 	http.HandleFunc("/webhook/atr/short", handleATRShort)
+	http.HandleFunc("/webhook/atr/idle", handleATRIdle)
 
 	// Stochastic Webhooks
 	http.HandleFunc("/webhook/stochastic/oversold", handleStochasticOversold)

@@ -27,6 +27,7 @@ services:
       - TRADING_END_HOUR_2=${TRADING_END_HOUR_2}
       - TRADING_DAYS=${TRADING_DAYS}
       - TRADING_TIMEZONE=${TRADING_TIMEZONE}
+      - DAILY_PROFIT_TARGET=${DAILY_PROFIT_TARGET}
     volumes:
       - ./strategies:/app/strategies:ro
     restart: unless-stopped
