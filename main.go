@@ -229,16 +229,16 @@ var (
 
 	oandaAPIKey       = os.Getenv("OANDA_API_KEY")
 	oandaAccountID    = os.Getenv("OANDA_ACCOUNT_ID")
-	oandaBaseURL      = "https://api-fxpractice.oanda.com" // Change to api-fxtrade.oanda.com for live
-	tradeUnits        string                               // Trading units (fixed amount)
-	tradeUSDAmount    string                               // USD notional amount (calculates units from price)
-	tradeMargin       string                               // Margin amount (OANDA calculates position size based on leverage)
-	takeProfitPips    string                               // Take profit in pips (e.g., "50")
-	takeProfitPct     string                               // Take profit in percentage (e.g., "2.5" for 2.5%)
-	takeProfitDollars string                               // Take profit in dollar amount (e.g., "100" for $100 gain)
-	stopLossPips      string                               // Stop loss in pips (e.g., "30")
-	stopLossPct       string                               // Stop loss in percentage (e.g., "1.5" for 1.5%)
-	stopLossDollars   string                               // Stop loss in dollar amount (e.g., "50" for $50 loss)
+	oandaBaseURL      string // Set in main() based on OANDA_LIVE env var
+	tradeUnits        string // Trading units (fixed amount)
+	tradeUSDAmount    string // USD notional amount (calculates units from price)
+	tradeMargin       string // Margin amount (OANDA calculates position size based on leverage)
+	takeProfitPips    string // Take profit in pips (e.g., "50")
+	takeProfitPct     string // Take profit in percentage (e.g., "2.5" for 2.5%)
+	takeProfitDollars string // Take profit in dollar amount (e.g., "100" for $100 gain)
+	stopLossPips      string // Stop loss in pips (e.g., "30")
+	stopLossPct       string // Stop loss in percentage (e.g., "1.5" for 1.5%)
+	stopLossDollars   string // Stop loss in dollar amount (e.g., "50" for $50 loss)
 
 	// Strategy system
 	activeStrategy          Strategy  // Currently loaded strategy
@@ -8521,6 +8521,15 @@ func main() {
 	// Validate environment variables
 	if oandaAPIKey == "" || oandaAccountID == "" {
 		log.Fatal("❌ OANDA_API_KEY and OANDA_ACCOUNT_ID must be set")
+	}
+
+	// Set OANDA API URL based on OANDA_LIVE environment variable
+	if os.Getenv("OANDA_LIVE") == "true" {
+		oandaBaseURL = "https://api-fxtrade.oanda.com"
+		log.Println("� LIVE TRADING MODE - Using production OANDA API")
+	} else {
+		oandaBaseURL = "https://api-fxpractice.oanda.com"
+		log.Println("🧪 PRACTICE MODE - Using demo OANDA API")
 	}
 
 	// Set trade configuration (priority: MARGIN_AMOUNT > TRADE_USD_AMOUNT > TRADE_UNITS)
