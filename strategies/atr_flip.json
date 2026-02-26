@@ -1,0 +1,58 @@
+{
+  "name": "ATR Trailing Stop with EMA Trend Filter",
+  "description": "Trend-following strategy using ATR trailing stop + 1H 200 EMA alignment. Long when ATR is bullish AND price > EMA. Short when ATR is bearish AND price < EMA. Goes FLAT (closes position) when ATR conflicts with EMA trend (Idle state).",
+  "long": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/long",
+          "description": "ATR Long signal (ATR bullish + price > 1H 200 EMA)"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/short",
+          "description": "ATR Short signal - reversal"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/idle",
+          "description": "ATR Idle - trend conflict, close and stay flat"
+        }
+      ]
+    }
+  },
+  "short": {
+    "entry": {
+      "combination": "all",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/short",
+          "description": "ATR Short signal (ATR bearish + price < 1H 200 EMA)"
+        }
+      ]
+    },
+    "exit": {
+      "combination": "any",
+      "conditions": [
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/long",
+          "description": "ATR Long signal - reversal"
+        },
+        {
+          "type": "condition",
+          "webhook": "/webhook/atr/idle",
+          "description": "ATR Idle - trend conflict, close and stay flat"
+        }
+      ]
+    }
+  }
+}

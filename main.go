@@ -70,8 +70,9 @@ type ExitConditions struct {
 // Strategy defines complete trading strategy
 // Supports either unified entry/exit OR separate long/short configurations
 type Strategy struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	OneTradeMode bool   `json:"oneTradeMode"` // If true, strategy disables after one trade cycle
 
 	// Option 1: Unified entry/exit (applies to both LONG and SHORT)
 	Entry *EntryConditions `json:"entry,omitempty"`
@@ -90,22 +91,26 @@ type PositionStrategy struct {
 
 // Position state for each symbol
 type PositionState struct {
-	Symbol             string
-	PositionOpen       bool
-	Position           string // "long" or "short"
-	TradeID            string
-	Exchange           string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
-	IsSimulated        bool    // True if this is a simulated trade (non-OANDA)
-	SimulatedEntry     string  // Entry time for simulated trade
-	SimulatedExit      string  // Exit time for simulated trade
-	SimulatedPrice     string  // Entry price for simulated trade
-	SimulatedExitPrice string  // Exit price for simulated trade
-	SimulatedPL        string  // Final P/L for simulated trade (stored on close)
-	LatestPrice        string  // Latest price from webhook (for P/L calculation)
-	MACDCrossedUp      bool    // Tracks if MACD crossed up
-	MACDCrossedDown    bool    // Tracks if MACD crossed down
-	SwingHigh          float64 // Latest swing high price level
-	SwingLow           float64 // Latest swing low price level
+	Symbol               string
+	PositionOpen         bool
+	PositionOpening      bool   // True when position open is in progress (prevents duplicate opens)
+	Position             string // "long" or "short"
+	TradeID              string
+	Exchange             string  // Exchange name (OANDA, NYSE, NASDAQ, etc.)
+	IsSimulated          bool    // True if this is a simulated trade (non-OANDA)
+	SimulatedEntry       string  // Entry time for simulated trade
+	SimulatedExit        string  // Exit time for simulated trade
+	SimulatedPrice       string  // Entry price for simulated trade
+	SimulatedExitPrice   string  // Exit price for simulated trade
+	SimulatedPL          string  // Final P/L for simulated trade (stored on close)
+	LatestPrice          string  // Latest price from webhook (for P/L calculation)
+	MACDCrossedUp        bool    // Tracks if MACD crossed up (true cross detected)
+	MACDCrossedDown      bool    // Tracks if MACD crossed down (true cross detected)
+	MACDAboveSignal      bool    // MACD line is currently above signal line
+	MACDBelowSignal      bool    // MACD line is currently below signal line
+	MACDStateInitialized bool    // True once we've seen at least one MACD state
+	SwingHigh            float64 // Latest swing high price level
+	SwingLow             float64 // Latest swing low price level
 
 	// Stochastic indicator tracking
 	StochInOversold   bool // Both K and D lines are in oversold (<20)
@@ -155,13 +160,33 @@ type PositionState struct {
 	EMA9AboveEMA21 bool // EMA 9 is currently above EMA 21
 	EMA9BelowEMA21 bool // EMA 9 is currently below EMA 21
 
+	// MA cross event tracking (set only on actual crosses, not position changes)
+	MA1CrossedAboveMA2 bool // MA1 actually crossed above MA2 (requires state change)
+	MA1CrossedBelowMA2 bool // MA1 actually crossed below MA2 (requires state change)
+
 	// MA Ribbon position tracking (for MA1/MA2/MA3 alignment)
 	MA2AboveMA3 bool // MA2 is currently above MA3
 	MA2BelowMA3 bool // MA2 is currently below MA3
 
+	// MA1 vs MA4 position tracking
+	MA1AboveMA4 bool // MA1 is currently above MA4
+	MA1BelowMA4 bool // MA1 is currently below MA4
+
 	// ATR volatility tracking
-	ATRAboveAverage bool // ATR is above its 20-period average (high volatility)
-	ATRBelowAverage bool // ATR is below its 20-period average (low volatility)
+	ATRAboveAverage         bool // ATR is above its 20-period average (high volatility)
+	ATRBelowAverage         bool // ATR is below its 20-period average (low volatility)
+	ATRAboveThreshold       bool // ATR is above a specific threshold value
+	ATRBelowThreshold       bool // ATR is below a specific threshold value
+	ATRDirectionLong        bool // Current ATR direction is long (for tracking persistent state)
+	ATRDirectionInitialized bool // Whether ATR direction has been initialized
+	ATRFlipLong             bool // ATR trailing stop flipped to long (actual change detected)
+	ATRFlipShort            bool // ATR trailing stop flipped to short (actual change detected)
+	ATRLong                 bool // ATR long signal
+	ATRShort                bool // ATR short signal
+	ATRIdle                 bool // ATR idle signal (trend conflict - no trading)
+	ATRLongCrossed          bool // ATR actually crossed to long (not just initial state)
+	ATRShortCrossed         bool // ATR actually crossed to short (not just initial state)
+	PositionOpenedWhileIdle bool // Position was opened externally while ATR was idle (wait for cross to close)
 
 	// MACD histogram tracking
 	MACDHistIncreasing bool // MACD histogram is increasing
@@ -180,34 +205,40 @@ type PositionState struct {
 	SMCHighHigh bool // SMC Higher High (HH) detected
 
 	// Cross detection initialization tracking
-	EMA9EMA21StateInitialized bool   // True once we've seen at least one position state (prevents false crosses on startup)
-	LastClosedDirection       string // Track last closed position direction ("long", "short", or "")
-	OppositeDirectionOccurred bool   // Track if opposite MA cross occurred after position close
+	EMA9EMA21StateInitialized bool // True once we've seen at least one position state (prevents false crosses on startup)
+
+	// OANDA Real-time P/L tracking (fetched from OANDA API)
+	OandaUnrealizedPL string // Current unrealized P/L from OANDA (e.g., "-2.45")
+	OandaRealizedPL   string // Realized P/L when position was closed
 
 	// Track which entry conditions have been completed
 	EntryConditionsCompleted map[string]bool // Maps condition index to completion status
 
 	// Track which exit conditions have been completed
 	ExitConditionsCompleted map[string]bool // Maps condition index to completion status
+
+	// Whipsaw protection
+	LastClosedDirection string // Tracks the last direction that was closed (for reversal logic)
 }
 
 // Global state management
 var (
-	positions = make(map[string]*PositionState)
-	mu        sync.RWMutex
+	positions       = make(map[string]*PositionState)
+	mu              sync.RWMutex
+	strategyEnabled = true // Strategy enabled flag - set to false after one trade cycle
 
 	oandaAPIKey       = os.Getenv("OANDA_API_KEY")
 	oandaAccountID    = os.Getenv("OANDA_ACCOUNT_ID")
-	oandaBaseURL      = "https://api-fxpractice.oanda.com" // Change to api-fxtrade.oanda.com for live
-	tradeUnits        string                               // Trading units (fixed amount)
-	tradeUSDAmount    string                               // USD notional amount (calculates units from price)
-	tradeMargin       string                               // Margin amount (OANDA calculates position size based on leverage)
-	takeProfitPips    string                               // Take profit in pips (e.g., "50")
-	takeProfitPct     string                               // Take profit in percentage (e.g., "2.5" for 2.5%)
-	takeProfitDollars string                               // Take profit in dollar amount (e.g., "100" for $100 gain)
-	stopLossPips      string                               // Stop loss in pips (e.g., "30")
-	stopLossPct       string                               // Stop loss in percentage (e.g., "1.5" for 1.5%)
-	stopLossDollars   string                               // Stop loss in dollar amount (e.g., "50" for $50 loss)
+	oandaBaseURL      string // Set in main() based on OANDA_LIVE env var
+	tradeUnits        string // Trading units (fixed amount)
+	tradeUSDAmount    string // USD notional amount (calculates units from price)
+	tradeMargin       string // Margin amount (OANDA calculates position size based on leverage)
+	takeProfitPips    string // Take profit in pips (e.g., "50")
+	takeProfitPct     string // Take profit in percentage (e.g., "2.5" for 2.5%)
+	takeProfitDollars string // Take profit in dollar amount (e.g., "100" for $100 gain)
+	stopLossPips      string // Stop loss in pips (e.g., "30")
+	stopLossPct       string // Stop loss in percentage (e.g., "1.5" for 1.5%)
+	stopLossDollars   string // Stop loss in dollar amount (e.g., "50" for $50 loss)
 
 	// Strategy system
 	activeStrategy          Strategy  // Currently loaded strategy
@@ -215,6 +246,28 @@ var (
 	firstWebhookStatusShown bool      // Track if first webhook status has been shown
 	lastStatusReportTime    time.Time // Track last time status was reported
 	timezoneOffset          int       // Timezone offset in hours (e.g., -5 for UTC-5, 0 for UTC)
+
+	// Trading hours configuration (supports two sessions)
+	tradingHoursEnabled   bool           // Whether trading hours restriction is enabled
+	tradingStartHour      int            // Session 1: Start hour (0-23) for allowed trading
+	tradingStartMinute    int            // Session 1: Start minute (0-59) for allowed trading
+	tradingEndHour        int            // Session 1: End hour (0-23) for allowed trading
+	tradingEndMinute      int            // Session 1: End minute (0-59) for allowed trading
+	tradingStartHour2     int            // Session 2: Start hour (0-23) for allowed trading
+	tradingStartMinute2   int            // Session 2: Start minute (0-59) for allowed trading
+	tradingEndHour2       int            // Session 2: End hour (0-23) for allowed trading
+	tradingEndMinute2     int            // Session 2: End minute (0-59) for allowed trading
+	session2Enabled       bool           // Whether session 2 is configured
+	tradingDays           []int          // Days of week when trading is allowed (0=Sunday, 1=Monday, ...6=Saturday)
+	tradingTimezone       *time.Location // Timezone for trading hours (default: uses timezoneOffset)
+	wasWithinTradingHours bool           // Track last known trading hours state to detect when hours open
+
+	// Daily profit tracking
+	dailyProfitTarget        float64   // Target profit for the day (disables trading when reached)
+	dailyProfitTargetEnabled bool      // Whether daily profit limit is enabled
+	dailyRealizedProfit      float64   // Total realized profit for today
+	dailyProfitResetTime     time.Time // When the daily profit counter was last reset
+	dailyProfitTargetReached bool      // Flag indicating daily target has been reached
 )
 
 // Get or create position state for a symbol
@@ -278,7 +331,318 @@ func updateLatestPrice(symbol string, price string) {
 				symbol, strings.ToUpper(state.Position), state.Exchange, price,
 				plColor, plSign, plDollars, plSign, plPercent)
 		}
+
+		// For real OANDA positions, update P/L in background
+		if state.PositionOpen && !state.IsSimulated && state.TradeID != "" {
+			go updateOandaPositionPL(symbol)
+		}
 	}
+}
+
+// ============================================================================
+// TRADING HOURS RESTRICTION
+// ============================================================================
+
+// isWithinTradingHours checks if the current time is within allowed trading hours
+// Returns true if trading is allowed, false if outside trading hours
+func isWithinTradingHours() bool {
+	// If trading hours restriction is disabled, always allow trading
+	if !tradingHoursEnabled {
+		return true
+	}
+
+	// Get current time in the configured timezone
+	var now time.Time
+	if tradingTimezone != nil {
+		now = time.Now().In(tradingTimezone)
+	} else {
+		// Fallback to UTC with offset
+		now = time.Now().UTC().Add(time.Duration(timezoneOffset) * time.Hour)
+	}
+
+	currentHour := now.Hour()
+	currentMinute := now.Minute()
+	currentDay := int(now.Weekday()) // 0=Sunday, 1=Monday, ...6=Saturday
+
+	// Check if current day is in allowed trading days
+	dayAllowed := false
+	if len(tradingDays) == 0 {
+		// If no days specified, allow all days
+		dayAllowed = true
+	} else {
+		for _, day := range tradingDays {
+			if day == currentDay {
+				dayAllowed = true
+				break
+			}
+		}
+	}
+
+	if !dayAllowed {
+		return false
+	}
+
+	// Convert current time to minutes since midnight for easier comparison
+	currentMinutesSinceMidnight := currentHour*60 + currentMinute
+
+	// Check Session 1
+	if isTimeInSession(currentMinutesSinceMidnight, tradingStartHour, tradingStartMinute, tradingEndHour, tradingEndMinute) {
+		return true
+	}
+
+	// Check Session 2 if enabled
+	if session2Enabled {
+		if isTimeInSession(currentMinutesSinceMidnight, tradingStartHour2, tradingStartMinute2, tradingEndHour2, tradingEndMinute2) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isTimeInSession checks if the current time (in minutes since midnight) is within a session
+func isTimeInSession(currentMinutes, startHour, startMinute, endHour, endMinute int) bool {
+	startMinutesSinceMidnight := startHour*60 + startMinute
+	endMinutesSinceMidnight := endHour*60 + endMinute
+
+	// Handle case where end time is less than start time (overnight trading)
+	if endMinutesSinceMidnight > startMinutesSinceMidnight {
+		// Normal hours: e.g., 9:30-17:00
+		return currentMinutes >= startMinutesSinceMidnight && currentMinutes < endMinutesSinceMidnight
+	} else {
+		// Overnight hours: e.g., 22:30-06:00
+		return currentMinutes >= startMinutesSinceMidnight || currentMinutes < endMinutesSinceMidnight
+	}
+}
+
+// formatTimeAMPM formats hour and minute to 12-hour AM/PM format
+func formatTimeAMPM(hour, minute int) string {
+	period := "AM"
+	displayHour := hour
+
+	if hour == 0 {
+		displayHour = 12
+	} else if hour == 12 {
+		period = "PM"
+	} else if hour > 12 {
+		displayHour = hour - 12
+		period = "PM"
+	}
+
+	if minute == 0 {
+		return fmt.Sprintf("%d%s", displayHour, period)
+	}
+	return fmt.Sprintf("%d:%02d%s", displayHour, minute, period)
+}
+
+// getTradingHoursStatus returns a human-readable status of trading hours configuration
+func getTradingHoursStatus() string {
+	if !tradingHoursEnabled {
+		return "Trading hours: No restrictions (24/7)"
+	}
+
+	dayNames := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	var allowedDays []string
+	if len(tradingDays) == 0 {
+		allowedDays = dayNames
+	} else {
+		for _, d := range tradingDays {
+			if d >= 0 && d <= 6 {
+				allowedDays = append(allowedDays, dayNames[d])
+			}
+		}
+	}
+
+	tzName := "UTC"
+	if tradingTimezone != nil {
+		tzName = tradingTimezone.String()
+	} else if timezoneOffset != 0 {
+		tzName = fmt.Sprintf("UTC%+d", timezoneOffset)
+	}
+
+	// Format Session 1 with AM/PM for readability
+	startTime1 := formatTimeAMPM(tradingStartHour, tradingStartMinute)
+	endTime1 := formatTimeAMPM(tradingEndHour, tradingEndMinute)
+	session1 := fmt.Sprintf("%s-%s", startTime1, endTime1)
+
+	if session2Enabled {
+		// Format Session 2
+		startTime2 := formatTimeAMPM(tradingStartHour2, tradingStartMinute2)
+		endTime2 := formatTimeAMPM(tradingEndHour2, tradingEndMinute2)
+		session2 := fmt.Sprintf("%s-%s", startTime2, endTime2)
+
+		return fmt.Sprintf("Trading hours: Session 1: %s | Session 2: %s (%s) on %s",
+			session1, session2, tzName, strings.Join(allowedDays, ","))
+	}
+
+	return fmt.Sprintf("Trading hours: %s %s on %s",
+		session1, tzName, strings.Join(allowedDays, ","))
+}
+
+// getActiveSessionName returns which session is currently active (for logging)
+func getActiveSessionName() string {
+	if !tradingHoursEnabled {
+		return "24/7"
+	}
+
+	var now time.Time
+	if tradingTimezone != nil {
+		now = time.Now().In(tradingTimezone)
+	} else {
+		now = time.Now().UTC().Add(time.Duration(timezoneOffset) * time.Hour)
+	}
+
+	currentMinutes := now.Hour()*60 + now.Minute()
+
+	if isTimeInSession(currentMinutes, tradingStartHour, tradingStartMinute, tradingEndHour, tradingEndMinute) {
+		return fmt.Sprintf("Session 1 (%s-%s)",
+			formatTimeAMPM(tradingStartHour, tradingStartMinute),
+			formatTimeAMPM(tradingEndHour, tradingEndMinute))
+	}
+
+	if session2Enabled && isTimeInSession(currentMinutes, tradingStartHour2, tradingStartMinute2, tradingEndHour2, tradingEndMinute2) {
+		return fmt.Sprintf("Session 2 (%s-%s)",
+			formatTimeAMPM(tradingStartHour2, tradingStartMinute2),
+			formatTimeAMPM(tradingEndHour2, tradingEndMinute2))
+	}
+
+	return "CLOSED"
+}
+
+// parseTimeString parses a time string in format "H" or "H:MM" and returns hour and minute
+// Supports formats like "9", "9:30", "14", "16:45", etc.
+func parseTimeString(timeStr string) (hour int, minute int, err error) {
+	timeStr = strings.TrimSpace(timeStr)
+
+	// Check if it contains a colon (H:MM format)
+	if strings.Contains(timeStr, ":") {
+		parts := strings.Split(timeStr, ":")
+		if len(parts) != 2 {
+			return 0, 0, fmt.Errorf("invalid time format (expected H:MM)")
+		}
+
+		hour, err = strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid hour: %v", err)
+		}
+
+		minute, err = strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid minute: %v", err)
+		}
+	} else {
+		// Just hour (H format)
+		hour, err = strconv.Atoi(timeStr)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid hour: %v", err)
+		}
+		minute = 0
+	}
+
+	// Validate ranges
+	if hour < 0 || hour > 24 {
+		return 0, 0, fmt.Errorf("hour must be 0-24, got %d", hour)
+	}
+	if minute < 0 || minute > 59 {
+		return 0, 0, fmt.Errorf("minute must be 0-59, got %d", minute)
+	}
+
+	return hour, minute, nil
+}
+
+// parseTradingDays parses a comma-separated string of day numbers (0-6) or day names
+func parseTradingDays(daysStr string) ([]int, error) {
+	if daysStr == "" {
+		return nil, nil // Empty means all days allowed
+	}
+
+	dayNameToNum := map[string]int{
+		"sun": 0, "sunday": 0,
+		"mon": 1, "monday": 1,
+		"tue": 2, "tuesday": 2,
+		"wed": 3, "wednesday": 3,
+		"thu": 4, "thursday": 4,
+		"fri": 5, "friday": 5,
+		"sat": 6, "saturday": 6,
+	}
+
+	parts := strings.Split(daysStr, ",")
+	var days []int
+	seen := make(map[int]bool)
+
+	for _, part := range parts {
+		part = strings.TrimSpace(strings.ToLower(part))
+		if part == "" {
+			continue
+		}
+
+		// Try parsing as number first
+		if num, err := strconv.Atoi(part); err == nil {
+			if num < 0 || num > 6 {
+				return nil, fmt.Errorf("day number %d out of range (0-6)", num)
+			}
+			if !seen[num] {
+				days = append(days, num)
+				seen[num] = true
+			}
+			continue
+		}
+
+		// Try parsing as day name
+		if num, ok := dayNameToNum[part]; ok {
+			if !seen[num] {
+				days = append(days, num)
+				seen[num] = true
+			}
+			continue
+		}
+
+		return nil, fmt.Errorf("invalid day value: %s", part)
+	}
+
+	// Sort days for consistent display
+	sort.Ints(days)
+	return days, nil
+}
+
+// ============================================================================
+// OANDA/FOREX DETECTION
+// ============================================================================
+
+// isForexPair checks if a symbol is a forex pair that should be traded on OANDA
+// This detects pairs like EUR_USD, GBP_JPY, EURUSD, GBPJPY etc. and ensures they use real OANDA trading
+// even if TradingView sends an exchange like "FX", "FOREX", "FXCM", etc.
+func isForexPair(symbol string) bool {
+	var base, quote string
+
+	if strings.Contains(symbol, "_") {
+		// Format: EUR_USD
+		parts := strings.Split(symbol, "_")
+		if len(parts) != 2 || len(parts[0]) != 3 || len(parts[1]) != 3 {
+			return false
+		}
+		base, quote = parts[0], parts[1]
+	} else if len(symbol) == 6 {
+		// Format: EURUSD (6 characters = two 3-letter currency codes)
+		base, quote = symbol[:3], symbol[3:]
+	} else {
+		return false
+	}
+
+	// Exclude crypto symbols (BTC, ETH, etc.)
+	cryptos := []string{"BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "DOT", "SOL", "XLM", "UNI", "TRX", "EOS", "NEO", "VET", "FIL", "XMR", "XTZ", "BNB", "CRO", "FTM", "ATOM", "ALGO", "HBAR", "EGLD", "ONE", "QNT", "CHZ", "ENJ", "MANA", "SAND", "AXS", "GALA", "DOGE", "SHIB", "MATIC", "AVAX", "LINK"}
+	for _, crypto := range cryptos {
+		if base == crypto || quote == crypto {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldUseOANDA determines if a symbol should be traded on OANDA (real trading)
+// Returns true for explicit OANDA exchange OR forex pairs (regardless of exchange field)
+func shouldUseOANDA(symbol string, exchange string) bool {
+	return exchange == "OANDA" || isForexPair(symbol)
 }
 
 // ============================================================================
@@ -309,27 +673,6 @@ func isShortEntryCondition(webhookPath string) bool {
 		}
 	}
 	return false
-}
-
-// Track that opposite direction condition occurred (for reversal tracking)
-func trackOppositeDirection(symbol string, webhookPath string) {
-	state := getPositionState(symbol)
-
-	// If last close was LONG and this is a SHORT entry condition, mark opposite occurred
-	if state.LastClosedDirection == "long" && isShortEntryCondition(webhookPath) {
-		mu.Lock()
-		state.OppositeDirectionOccurred = true
-		mu.Unlock()
-		log.Printf("✅ [REVERSAL] SHORT entry condition triggered after LONG close - reversal confirmed")
-	}
-
-	// If last close was SHORT and this is a LONG entry condition, mark opposite occurred
-	if state.LastClosedDirection == "short" && isLongEntryCondition(webhookPath) {
-		mu.Lock()
-		state.OppositeDirectionOccurred = true
-		mu.Unlock()
-		log.Printf("✅ [REVERSAL] LONG entry condition triggered after SHORT close - reversal confirmed")
-	}
 }
 
 // Load strategy from JSON file
@@ -366,6 +709,11 @@ func loadStrategy(name string) (*Strategy, error) {
 	log.Printf("⭐ STRATEGY LOADED: %s", strings.ToUpper(strategy.Name))
 	log.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Printf("📖 %s", strategy.Description)
+	if strategy.OneTradeMode {
+		log.Printf("🔒 One Trade Mode: ENABLED (strategy will disable after one trade cycle)")
+	} else {
+		log.Printf("♻️  Continuous Mode: Strategy will continue monitoring after trades")
+	}
 	log.Println("")
 
 	// Log based on strategy format
@@ -760,6 +1108,54 @@ func conditionNodeMatches(node *ConditionNode, currentPath string, state map[str
 	return false, false
 }
 
+// requiresCrossEvent checks if a webhook condition requires a cross/flip event to trigger
+func requiresCrossEvent(webhookPath string) bool {
+	switch webhookPath {
+	case "/webhook/atr/long", "/webhook/atr/short",
+		"/webhook/atr/flip-long", "/webhook/atr/flip-short":
+		return true
+	default:
+		return false
+	}
+}
+
+// hasCrossedRecently checks if a cross-required condition has actually crossed
+func hasCrossedRecently(webhookPath string, state *PositionState) bool {
+	switch webhookPath {
+	case "/webhook/atr/long":
+		// Only true if we actually crossed from short to long
+		return state.ATRLongCrossed
+	case "/webhook/atr/short":
+		// Only true if we actually crossed from long to short
+		return state.ATRShortCrossed
+	case "/webhook/atr/flip-long":
+		return state.ATRFlipLong
+	case "/webhook/atr/flip-short":
+		return state.ATRFlipShort
+	default:
+		return true // Non-cross conditions are always "crossed"
+	}
+}
+
+// isPendingCross checks if we're waiting for the ATR to cross TO this condition
+// (i.e., the opposite direction is currently active and initialized)
+func isPendingCross(webhookPath string, state *PositionState) bool {
+	if !state.ATRDirectionInitialized {
+		return false
+	}
+
+	switch webhookPath {
+	case "/webhook/atr/long", "/webhook/atr/flip-long":
+		// Pending cross to long = we're currently in short direction
+		return !state.ATRDirectionLong
+	case "/webhook/atr/short", "/webhook/atr/flip-short":
+		// Pending cross to short = we're currently in long direction
+		return state.ATRDirectionLong
+	default:
+		return false
+	}
+}
+
 // isConditionCurrentlyMet checks if a condition reflects the current state (not just if it was triggered)
 func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 	switch webhookPath {
@@ -839,13 +1235,17 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 	case "/webhook/ma/ma1-cross-down-ma2":
 		return state.EMA9CrossedDownEMA21 // Reuse EMA 9/21 state for MA#1/MA#2
 	case "/webhook/ma/ma1-above-ma2":
-		return state.EMA9AboveEMA21
+		return state.EMA9AboveEMA21 // Check persistent state
 	case "/webhook/ma/ma1-below-ma2":
-		return state.EMA9BelowEMA21
+		return state.EMA9BelowEMA21 // Check persistent state
 	case "/webhook/ma/ma2-above-ma3":
 		return state.MA2AboveMA3
 	case "/webhook/ma/ma2-below-ma3":
 		return state.MA2BelowMA3
+	case "/webhook/ma/ma1-above-ma4":
+		return state.MA1AboveMA4
+	case "/webhook/ma/ma1-below-ma4":
+		return state.MA1BelowMA4
 
 	// EMA crossover conditions
 	case "/webhook/ema/9-cross-up-21":
@@ -904,6 +1304,20 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 		return state.ATRAboveAverage
 	case "/webhook/atr/below-average":
 		return state.ATRBelowAverage
+	case "/webhook/atr/above-threshold":
+		return state.ATRAboveThreshold
+	case "/webhook/atr/below-threshold":
+		return state.ATRBelowThreshold
+	case "/webhook/atr/flip-long":
+		return state.ATRFlipLong
+	case "/webhook/atr/flip-short":
+		return state.ATRFlipShort
+	case "/webhook/atr/long":
+		return state.ATRLong
+	case "/webhook/atr/short":
+		return state.ATRShort
+	case "/webhook/atr/idle":
+		return state.ATRIdle
 
 	// SMC (Smart Money Concept) structure conditions
 	case "/webhook/smc/low-low":
@@ -924,6 +1338,21 @@ func isConditionCurrentlyMet(webhookPath string, state *PositionState) bool {
 
 // Check if all entry conditions are met for opening a position
 func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
+	// Check if strategy is enabled first
+	mu.RLock()
+	enabled := strategyEnabled
+	targetReached := dailyProfitTargetReached
+	mu.RUnlock()
+	if !enabled {
+		return false
+	}
+
+	// Check if daily profit target has been reached
+	if dailyProfitTargetEnabled && targetReached {
+		log.Printf("🎯 [DAILY] Daily profit target reached - new positions blocked")
+		return false
+	}
+
 	state := getPositionState(symbol)
 
 	// Determine prefix for condition keys to avoid conflicts between LONG and SHORT
@@ -1000,6 +1429,16 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 
 			if allComplete {
 				log.Printf("🎯 [STRATEGY] All entry conditions completed IN ORDER!")
+
+				// Check if within allowed trading hours AFTER conditions are met
+				if !isWithinTradingHours() {
+					log.Printf("⏰ [BLOCKED] Position ready to open but outside trading hours")
+					log.Printf("   %s", getTradingHoursStatus())
+					log.Printf("   Conditions remain tracked and will execute when trading hours resume")
+					// Don't reset conditions - keep them for when trading hours resume
+					return false
+				}
+
 				// Reset conditions for next trade
 				mu.Lock()
 				state.EntryConditionsCompleted = make(map[string]bool)
@@ -1053,6 +1492,11 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 					allComplete = false
 					break
 				}
+				// For conditions that require a cross, also check if the cross actually happened
+				if requiresCrossEvent(condition.Webhook) && !hasCrossedRecently(condition.Webhook, state) {
+					allComplete = false
+					break
+				}
 			} else {
 				// For groups or other types, fall back to tracking map
 				key := fmt.Sprintf("%scondition_%d", conditionPrefix, i)
@@ -1065,6 +1509,16 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 
 		if allComplete {
 			log.Printf("🎯 [STRATEGY] All entry conditions met!")
+
+			// Check if within allowed trading hours AFTER conditions are met
+			if !isWithinTradingHours() {
+				log.Printf("⏰ [BLOCKED] Position ready to open but outside trading hours")
+				log.Printf("   %s", getTradingHoursStatus())
+				log.Printf("   Conditions remain tracked and will execute when trading hours resume")
+				// Don't reset conditions - keep them for when trading hours resume
+				return false
+			}
+
 			// Reset conditions for next trade
 			mu.Lock()
 			state.EntryConditionsCompleted = make(map[string]bool)
@@ -1082,6 +1536,14 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 
 			if matched && complete {
 				log.Printf("🎯 [STRATEGY] Entry condition met: %s", getNodeDescription(&node))
+
+				// Check if within allowed trading hours AFTER condition is met
+				if !isWithinTradingHours() {
+					log.Printf("⏰ [BLOCKED] Position ready to open but outside trading hours")
+					log.Printf("   %s", getTradingHoursStatus())
+					return false
+				}
+
 				return true
 			}
 		}
@@ -1387,6 +1849,16 @@ func isWebhookUsedInStrategy(webhookPath string) bool {
 
 // POST /webhook/macd/cross-up
 func handleMACDCrossUp(w http.ResponseWriter, r *http.Request) {
+	// Check if strategy is enabled
+	mu.RLock()
+	enabled := strategyEnabled
+	mu.RUnlock()
+	if !enabled {
+		log.Printf("🛑 [STRATEGY] Strategy DISABLED - ignoring MACD Cross Up webhook")
+		respondSuccess(w, "Strategy disabled")
+		return
+	}
+
 	// Check if this webhook is used in the active strategy
 	if !isWebhookUsedInStrategy("/webhook/macd/cross-up") {
 		log.Printf("⏭️  [WEBHOOK] MACD Cross Up not used in current strategy - ignoring")
@@ -1414,18 +1886,26 @@ func handleMACDCrossUp(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/macd/cross-up")
+	// Check if this is a real cross by comparing with the opposite state
+	// MACD was below signal, now above = cross detected
+	// Only count as cross if state was initialized AND opposite state was true
+	wasCross := state.MACDStateInitialized && state.MACDBelowSignal
 
-	log.Printf("📊 MACD Cross Up for %s", symbol)
+	log.Printf("📊 MACD Cross Up for %s (wasCross=%v, initialized=%v)", symbol, wasCross, state.MACDStateInitialized)
 
 	mu.Lock()
-	state.MACDCrossedUp = true
-	state.MACDCrossedDown = false // Reset opposite condition
+	state.MACDAboveSignal = true
+	state.MACDBelowSignal = false
+	state.MACDStateInitialized = true
+	// Set cross flag ONLY if actual cross detected (state change from below to above)
+	if wasCross {
+		state.MACDCrossedUp = true
+		state.MACDCrossedDown = false
+	}
 	mu.Unlock()
 
 	// Check if we should exit SHORT position (reversal)
-	if state.PositionOpen && state.Position == "short" {
+	if wasCross && state.PositionOpen && state.Position == "short" {
 		shouldExit, reason := shouldExitPosition(symbol, false, r)
 		if shouldExit {
 			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
@@ -1437,8 +1917,8 @@ func handleMACDCrossUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if we should open LONG position
-	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+	// Check if we should open LONG position (only on real cross)
+	if wasCross && shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
 		openLongPosition(symbol, event.Close)
 		respondSuccess(w, "MACD cross up + strategy → LONG opened")
@@ -1477,18 +1957,26 @@ func handleMACDCrossDown(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/macd/cross-down")
+	// Check if this is a real cross by comparing with the opposite state
+	// MACD was above signal, now below = cross detected
+	// Only count as cross if state was initialized AND opposite state was true
+	wasCross := state.MACDStateInitialized && state.MACDAboveSignal
 
-	log.Printf("📊 MACD Cross Down for %s", symbol)
+	log.Printf("📊 MACD Cross Down for %s (wasCross=%v, initialized=%v)", symbol, wasCross, state.MACDStateInitialized)
 
 	mu.Lock()
-	state.MACDCrossedDown = true
-	state.MACDCrossedUp = false // Reset opposite condition
+	state.MACDBelowSignal = true
+	state.MACDAboveSignal = false
+	state.MACDStateInitialized = true
+	// Set cross flag ONLY if actual cross detected (state change from above to below)
+	if wasCross {
+		state.MACDCrossedDown = true
+		state.MACDCrossedUp = false
+	}
 	mu.Unlock()
 
 	// Check if we should exit LONG position (reversal)
-	if state.PositionOpen && state.Position == "long" {
+	if wasCross && state.PositionOpen && state.Position == "long" {
 		shouldExit, reason := shouldExitPosition(symbol, true, r)
 		if shouldExit {
 			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
@@ -1500,8 +1988,8 @@ func handleMACDCrossDown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if we should open SHORT position
-	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+	// Check if we should open SHORT position (only on real cross)
+	if wasCross && shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
 		openShortPosition(symbol, event.Close)
 		respondSuccess(w, "MACD cross down + strategy → SHORT opened")
@@ -2123,9 +2611,6 @@ func handleRSIAbove50(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/rsi/above-50")
-
 	// Update latest price for P/L calculation
 	updateLatestPrice(symbol, event.Close)
 
@@ -2140,6 +2625,18 @@ func handleRSIAbove50(w http.ResponseWriter, r *http.Request) {
 	state.RSIAbove50 = true
 	state.RSIBelow50 = false
 	mu.Unlock()
+
+	// Check if we should exit SHORT position (RSI above 50 is bullish)
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+		respondSuccess(w, "RSI above 50 condition set")
+		return
+	}
 
 	// Check if we should open LONG position
 	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
@@ -2180,15 +2677,24 @@ func handleRSIBelow50(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/rsi/below-50")
-
 	log.Printf("📊 RSI crossed BELOW 50 (downtrend) for %s", symbol)
 
 	mu.Lock()
 	state.RSIBelow50 = true
 	state.RSIAbove50 = false
 	mu.Unlock()
+
+	// Check if we should exit LONG position (RSI below 50 is bearish)
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+		respondSuccess(w, "RSI below 50 condition set")
+		return
+	}
 
 	// Check if we should open SHORT position
 	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
@@ -2199,6 +2705,534 @@ func handleRSIBelow50(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondSuccess(w, "RSI below 50 condition set")
+}
+
+// ============================================================================
+// ATR THRESHOLD HANDLERS
+// ============================================================================
+
+// POST /webhook/atr/above-threshold
+func handleATRAboveThreshold(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/above-threshold") {
+		log.Printf("⏭️  [WEBHOOK] ATR Above Threshold not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Above Threshold event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	log.Printf("📊 ATR is above threshold for %s (high volatility)", symbol)
+
+	mu.Lock()
+	state.ATRAboveThreshold = true
+	state.ATRBelowThreshold = false
+	mu.Unlock()
+
+	// Check if we should open position (can be used for either direction)
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "ATR above threshold + strategy → LONG opened")
+		return
+	}
+
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "ATR above threshold + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "ATR above threshold condition set")
+}
+
+// POST /webhook/atr/below-threshold
+func handleATRBelowThreshold(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	// Also accept if above-threshold is used (we need to reset its state)
+	if !isWebhookUsedInStrategy("/webhook/atr/below-threshold") && !isWebhookUsedInStrategy("/webhook/atr/above-threshold") {
+		log.Printf("⏭️  [WEBHOOK] ATR Below Threshold not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Below Threshold event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	log.Printf("📊 ATR is below threshold for %s (low volatility - blocking entries)", symbol)
+
+	mu.Lock()
+	state.ATRBelowThreshold = true
+	state.ATRAboveThreshold = false
+	mu.Unlock()
+
+	// ATR below threshold should prevent new entries - no position checks
+	log.Printf("⛔ ATR below threshold - no new positions allowed")
+	respondSuccess(w, "ATR below threshold - no entries")
+}
+
+// POST /webhook/atr/flip-long
+func handleATRFlipLong(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/flip-long") {
+		log.Printf("⏭️  [WEBHOOK] ATR Flip Long not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Flip Long event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Check if this is a real flip by comparing with the opposite state
+	// ATR was short direction, now long = flip detected
+	// Only count as flip if state was initialized AND opposite direction was true
+	wasFlip := state.ATRDirectionInitialized && !state.ATRDirectionLong
+
+	log.Printf("📊 ATR Flip Long for %s (wasFlip=%v, initialized=%v, wasLong=%v)",
+		symbol, wasFlip, state.ATRDirectionInitialized, state.ATRDirectionLong)
+
+	mu.Lock()
+	// Update direction tracking
+	state.ATRDirectionLong = true
+	state.ATRDirectionInitialized = true
+	// Set flip flag ONLY if actual flip detected (state change from short to long)
+	if wasFlip {
+		state.ATRFlipLong = true
+		state.ATRFlipShort = false
+	}
+	mu.Unlock()
+
+	// Check if we should exit SHORT position (reversal) - only on real flip
+	if wasFlip && state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+	}
+
+	// Check if we should open LONG position (only on real flip)
+	if wasFlip && shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "ATR flip long + strategy → LONG opened")
+		return
+	}
+
+	respondSuccess(w, "ATR flip long condition set")
+}
+
+// POST /webhook/atr/flip-short
+func handleATRFlipShort(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/flip-short") {
+		log.Printf("⏭️  [WEBHOOK] ATR Flip Short not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Flip Short event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Check if this is a real flip by comparing with the opposite state
+	// ATR was long direction, now short = flip detected
+	// Only count as flip if state was initialized AND opposite direction was true
+	wasFlip := state.ATRDirectionInitialized && state.ATRDirectionLong
+
+	log.Printf("📊 ATR Flip Short for %s (wasFlip=%v, initialized=%v, wasLong=%v)",
+		symbol, wasFlip, state.ATRDirectionInitialized, state.ATRDirectionLong)
+
+	mu.Lock()
+	// Update direction tracking
+	state.ATRDirectionLong = false
+	state.ATRDirectionInitialized = true
+	// Set flip flag ONLY if actual flip detected (state change from long to short)
+	if wasFlip {
+		state.ATRFlipShort = true
+		state.ATRFlipLong = false
+	}
+	mu.Unlock()
+
+	// Check if we should exit LONG position (reversal) - only on real flip
+	if wasFlip && state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+	}
+
+	// Check if we should open SHORT position (only on real flip)
+	if wasFlip && shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "ATR flip short + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "ATR flip short condition set")
+}
+
+// POST /webhook/atr/long
+func handleATRLong(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/long") {
+		log.Printf("⏭️  [WEBHOOK] ATR Long not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Long event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Check previous state for cross detection
+	wasShort := state.ATRShort
+	wasLong := state.ATRLong
+	wasIdle := state.ATRIdle
+	wasInitialized := state.ATRLong || state.ATRShort || state.ATRIdle
+
+	// Cross = any state change (short→long OR idle→long)
+	isCross := wasShort || wasIdle
+
+	log.Printf("📊 ATR long signal for %s (wasShort=%v, wasLong=%v, wasIdle=%v, initialized=%v, isCross=%v)",
+		symbol, wasShort, wasLong, wasIdle, wasInitialized, isCross)
+
+	mu.Lock()
+	state.ATRLong = true
+	state.ATRShort = false
+	state.ATRIdle = false
+	if isCross {
+		state.ATRLongCrossed = true
+		state.ATRShortCrossed = false
+		// Clear the idle-opened flag on direction change - position will be evaluated for exit
+		state.PositionOpenedWhileIdle = false
+	}
+	mu.Unlock()
+
+	// First signal after startup/reset - initialize only, no trade
+	if !wasInitialized {
+		log.Printf("⏳ [INIT] First ATR signal - initializing as LONG, waiting for next cross")
+		respondSuccess(w, "ATR long initialized - waiting for cross")
+		return
+	}
+
+	// Repeated signal - no state change, no action
+	if wasLong {
+		log.Printf("ℹ️  [LONG→LONG] Already in long state - no change")
+		respondSuccess(w, "ATR long condition maintained")
+		return
+	}
+
+	// Cross detected (from short or idle)
+	if wasShort {
+		log.Printf("✅ [SHORT→LONG] Cross detected")
+	} else if wasIdle {
+		log.Printf("✅ [IDLE→LONG] Cross detected")
+	}
+
+	// Check if we should exit SHORT position
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			respondSuccess(w, "ATR long cross → SHORT closed")
+			return
+		}
+	}
+
+	// Check if we should open LONG position
+	if !state.PositionOpen && shouldOpenPosition(symbol, true, r) {
+		log.Printf("✅ [TRADE] ATR long cross + strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "ATR long cross → LONG opened")
+		return
+	}
+
+	respondSuccess(w, "ATR long cross condition set")
+}
+
+// POST /webhook/atr/short
+func handleATRShort(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/short") {
+		log.Printf("⏭️  [WEBHOOK] ATR Short not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Short event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Check previous state for cross detection
+	wasLong := state.ATRLong
+	wasShort := state.ATRShort
+	wasIdle := state.ATRIdle
+	wasInitialized := state.ATRLong || state.ATRShort || state.ATRIdle
+
+	// Cross = any state change (long→short OR idle→short)
+	isCross := wasLong || wasIdle
+
+	log.Printf("📊 ATR short signal for %s (wasLong=%v, wasShort=%v, wasIdle=%v, initialized=%v, isCross=%v)",
+		symbol, wasLong, wasShort, wasIdle, wasInitialized, isCross)
+
+	mu.Lock()
+	state.ATRShort = true
+	state.ATRLong = false
+	state.ATRIdle = false
+	if isCross {
+		state.ATRShortCrossed = true
+		state.ATRLongCrossed = false
+		// Clear the idle-opened flag on direction change - position will be evaluated for exit
+		state.PositionOpenedWhileIdle = false
+	}
+	mu.Unlock()
+
+	// First signal after startup/reset - initialize only, no trade
+	if !wasInitialized {
+		log.Printf("⏳ [INIT] First ATR signal - initializing as SHORT, waiting for next cross")
+		respondSuccess(w, "ATR short initialized - waiting for cross")
+		return
+	}
+
+	// Repeated signal - no state change, no action
+	if wasShort {
+		log.Printf("ℹ️  [SHORT→SHORT] Already in short state - no change")
+		respondSuccess(w, "ATR short condition maintained")
+		return
+	}
+
+	// Cross detected (from long or idle)
+	if wasLong {
+		log.Printf("✅ [LONG→SHORT] Cross detected")
+	} else if wasIdle {
+		log.Printf("✅ [IDLE→SHORT] Cross detected")
+	}
+
+	// Check if we should exit LONG position
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			respondSuccess(w, "ATR short cross → LONG closed")
+			return
+		}
+	}
+
+	// Check if we should open SHORT position
+	if !state.PositionOpen && shouldOpenPosition(symbol, false, r) {
+		log.Printf("✅ [TRADE] ATR short cross + strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "ATR short cross → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "ATR short cross condition set")
+}
+
+// POST /webhook/atr/idle
+// ATR Idle signal - ATR direction conflicts with long-term trend (1H 200 EMA)
+// This closes any open position and prevents new trades until Long or Short fires again
+func handleATRIdle(w http.ResponseWriter, r *http.Request) {
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy("/webhook/atr/idle") {
+		log.Printf("⏭️  [WEBHOOK] ATR Idle not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received ATR Idle event (trend conflict)")
+
+	// Sync positions from OANDA to detect externally opened positions before deciding
+	if err := periodicSyncPositionsFromOanda(); err != nil {
+		log.Printf("⚠️  [SYNC] Failed to sync positions: %v", err)
+	}
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Check previous state for cross detection
+	wasLong := state.ATRLong
+	wasShort := state.ATRShort
+	wasIdle := state.ATRIdle
+	wasInitialized := state.ATRLong || state.ATRShort || state.ATRIdle
+
+	// Cross = any state change (long→idle OR short→idle)
+	isCross := wasLong || wasShort
+
+	log.Printf("⚠️  ATR Idle for %s (wasLong=%v, wasShort=%v, wasIdle=%v, initialized=%v, isCross=%v)",
+		symbol, wasLong, wasShort, wasIdle, wasInitialized, isCross)
+
+	// Set idle state
+	mu.Lock()
+	state.ATRIdle = true
+	state.ATRLong = false
+	state.ATRShort = false
+	state.ATRFlipLong = false
+	state.ATRFlipShort = false
+	state.ATRLongCrossed = false
+	state.ATRShortCrossed = false
+	mu.Unlock()
+
+	// First signal after startup/reset - initialize only, no action
+	if !wasInitialized {
+		log.Printf("⏳ [INIT] First ATR signal - initializing as IDLE, waiting for next cross")
+		respondSuccess(w, "ATR idle initialized - waiting for cross")
+		return
+	}
+
+	// Repeated signal - no state change, no action
+	if wasIdle {
+		log.Printf("ℹ️  [IDLE→IDLE] Already in idle state - no change")
+		respondSuccess(w, "ATR idle condition maintained")
+		return
+	}
+
+	// Cross detected (from long or short) - close any open position
+	if wasLong {
+		log.Printf("✅ [LONG→IDLE] Cross detected - trend conflict")
+	} else if wasShort {
+		log.Printf("✅ [SHORT→IDLE] Cross detected - trend conflict")
+	}
+
+	if state.PositionOpen {
+		// Check if position was opened externally during idle - let it ride until next ATR direction change
+		if state.PositionOpenedWhileIdle {
+			log.Printf("ℹ️  [IDLE] Position was opened externally during idle - letting it ride until next ATR cross")
+			respondSuccess(w, "ATR idle - external position waiting for next cross")
+			return
+		}
+		posType := state.Position
+		log.Println(strings.Repeat("⚪", 40))
+		log.Printf("⚪ ATR IDLE - Trend conflict detected!")
+		log.Printf("⚪ Closing %s position for %s", strings.ToUpper(posType), symbol)
+		log.Printf("⚪ Will stay FLAT until ATR Long or ATR Short fires")
+		log.Println(strings.Repeat("⚪", 40))
+		closePosition(symbol)
+		respondSuccess(w, fmt.Sprintf("ATR idle cross → %s closed, staying flat", strings.ToUpper(posType)))
+		return
+	}
+
+	log.Printf("ℹ️  [IDLE] No open position - staying flat until trend aligns")
+
+	respondSuccess(w, "ATR idle cross - no trading until Long or Short fires")
 }
 
 // ============================================================================
@@ -3060,14 +4094,24 @@ func handlePriceAboveMA2(w http.ResponseWriter, r *http.Request) {
 	state := getPositionState(symbol)
 
 	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/ma/price-above-ma2")
-
 	log.Printf("📊 Price is above MA#2 for %s", symbol)
 
 	mu.Lock()
 	state.PriceAboveEMA20 = true
 	state.PriceBelowEMA20 = false
 	mu.Unlock()
+
+	// Check if we should exit SHORT position (price above MA2 is bullish)
+	if state.PositionOpen && state.Position == "short" {
+		shouldExit, reason := shouldExitPosition(symbol, false, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+		respondSuccess(w, "Price above MA#2 condition set")
+		return
+	}
 
 	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
@@ -3104,14 +4148,24 @@ func handlePriceBelowMA2(w http.ResponseWriter, r *http.Request) {
 	state := getPositionState(symbol)
 
 	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/ma/price-below-ma2")
-
 	log.Printf("📊 Price is below MA#2 for %s", symbol)
 
 	mu.Lock()
 	state.PriceBelowEMA20 = true
 	state.PriceAboveEMA20 = false
 	mu.Unlock()
+
+	// Check if we should exit LONG position (price below MA2 is bearish)
+	if state.PositionOpen && state.Position == "long" {
+		shouldExit, reason := shouldExitPosition(symbol, true, r)
+		if shouldExit {
+			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
+			closePosition(symbol)
+			state = getPositionState(symbol)
+		}
+		respondSuccess(w, "Price below MA#2 condition set")
+		return
+	}
 
 	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
@@ -3261,41 +4315,49 @@ func handleMA1AboveMA2(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Check if this is a cross by comparing with the opposite state
+	// Check if this is a real cross by comparing with previous state
 	// MA1 was below MA2, now above = cross detected
-	wasCross := state.EMA9BelowEMA21
+	// Only count as cross if state was initialized AND opposite state was true
+	wasCross := state.EMA9EMA21StateInitialized && state.EMA9BelowEMA21
 
-	log.Printf("📊 MA#1 above MA#2 for %s", symbol)
+	log.Printf("📊 MA#1 above MA#2 for %s (wasCross=%v, initialized=%v)", symbol, wasCross, state.EMA9EMA21StateInitialized)
 
-	// Track if this is an opposite direction condition after position close
-	trackOppositeDirection(symbol, "/webhook/ma/ma1-above-ma2")
-
+	// Set state and clear opposite condition
 	mu.Lock()
 	state.EMA9AboveEMA21 = true
 	state.EMA9BelowEMA21 = false
 	state.EMA9EMA21StateInitialized = true
+	// Set cross flag ONLY if actual cross detected
+	if wasCross {
+		state.MA1CrossedAboveMA2 = true
+		state.MA1CrossedBelowMA2 = false
+	}
 	mu.Unlock()
 
-	// Only allow LONG entry if: no position open AND (first trade OR last was SHORT OR saw opposite cross after LONG close)
-	canEnterLong := !state.PositionOpen && (state.LastClosedDirection == "" || state.LastClosedDirection == "short" || state.OppositeDirectionOccurred)
+	// Clear opposite entry condition if it was set
+	clearEntryConditionForWebhook(symbol, "/webhook/ma/ma1-below-ma2")
 
-	if wasCross && canEnterLong {
-		log.Printf("✅ [STRATEGY] Entry condition met: MA1 crosses above MA2 - triggers entry")
-		if shouldOpenPosition(symbol, true, r) {
-			log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
-			openLongPosition(symbol, event.Close)
-			respondSuccess(w, "MA1 crossed above MA2 + strategy → LONG opened")
-			return
-		}
-	} else if wasCross && state.PositionOpen && state.Position == "short" {
-		// Check if this should trigger SHORT exit
+	// Check if we should exit SHORT position (only on real cross)
+	if wasCross && state.PositionOpen && state.Position == "short" {
 		shouldExit, _ := shouldExitPosition(symbol, false, r)
 		if shouldExit {
 			log.Printf("🚨 [EXIT] MA1 crossed above MA2 - exiting SHORT position")
 			closePosition(symbol)
-			respondSuccess(w, "MA1 crossed above MA2 → SHORT closed")
+			respondSuccess(w, "MA1 above MA2 → SHORT closed")
 			return
 		}
+	}
+
+	// Check if we should open LONG position (only on real cross)
+	if wasCross && shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] MA1 crossed above MA2 + strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA1 above MA2 + strategy → LONG opened")
+		return
+	}
+
+	if !state.EMA9EMA21StateInitialized || !wasCross {
+		log.Printf("⏳ [INIT] MA1 above MA2 - state initialized, waiting for next cross to trigger")
 	}
 
 	respondSuccess(w, "MA#1 above MA#2 condition set")
@@ -3325,41 +4387,49 @@ func handleMA1BelowMA2(w http.ResponseWriter, r *http.Request) {
 	updateLatestPrice(symbol, event.Close)
 	state := getPositionState(symbol)
 
-	// Check if this is a cross by comparing with the opposite state
+	// Check if this is a real cross by comparing with previous state
 	// MA1 was above MA2, now below = cross detected
-	wasCross := state.EMA9AboveEMA21
+	// Only count as cross if state was initialized AND opposite state was true
+	wasCross := state.EMA9EMA21StateInitialized && state.EMA9AboveEMA21
 
-	log.Printf("📊 MA#1 below MA#2 for %s", symbol)
+	log.Printf("📊 MA#1 below MA#2 for %s (wasCross=%v, initialized=%v)", symbol, wasCross, state.EMA9EMA21StateInitialized)
 
-	// Track if this is an opposite direction condition after position close
-	trackOppositeDirection(symbol, "/webhook/ma/ma1-below-ma2")
-
+	// Set state and clear opposite condition
 	mu.Lock()
 	state.EMA9BelowEMA21 = true
 	state.EMA9AboveEMA21 = false
 	state.EMA9EMA21StateInitialized = true
+	// Set cross flag ONLY if actual cross detected
+	if wasCross {
+		state.MA1CrossedBelowMA2 = true
+		state.MA1CrossedAboveMA2 = false
+	}
 	mu.Unlock()
 
-	// Only allow SHORT entry if: no position open AND (first trade OR last was LONG OR saw opposite cross after SHORT close)
-	canEnterShort := !state.PositionOpen && (state.LastClosedDirection == "" || state.LastClosedDirection == "long" || state.OppositeDirectionOccurred)
+	// Clear opposite entry condition if it was set
+	clearEntryConditionForWebhook(symbol, "/webhook/ma/ma1-above-ma2")
 
-	if wasCross && canEnterShort {
-		log.Printf("✅ [STRATEGY] Entry condition met: MA1 crosses below MA2 - triggers entry")
-		if shouldOpenPosition(symbol, false, r) {
-			log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
-			openShortPosition(symbol, event.Close)
-			respondSuccess(w, "MA1 crossed below MA2 + strategy → SHORT opened")
-			return
-		}
-	} else if wasCross && state.PositionOpen && state.Position == "long" {
-		// Check if this should trigger LONG exit
+	// Check if we should exit LONG position (only on real cross)
+	if wasCross && state.PositionOpen && state.Position == "long" {
 		shouldExit, _ := shouldExitPosition(symbol, true, r)
 		if shouldExit {
 			log.Printf("🚨 [EXIT] MA1 crossed below MA2 - exiting LONG position")
 			closePosition(symbol)
-			respondSuccess(w, "MA1 crossed below MA2 → LONG closed")
+			respondSuccess(w, "MA1 below MA2 → LONG closed")
 			return
 		}
+	}
+
+	// Check if we should open SHORT position (only on real cross)
+	if wasCross && shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] MA1 crossed below MA2 + strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA1 below MA2 + strategy → SHORT opened")
+		return
+	}
+
+	if !state.EMA9EMA21StateInitialized || !wasCross {
+		log.Printf("⏳ [INIT] MA1 below MA2 - state initialized, waiting for next cross to trigger")
 	}
 
 	respondSuccess(w, "MA#1 below MA#2 condition set")
@@ -3390,8 +4460,6 @@ func handleMA2AboveMA3(w http.ResponseWriter, r *http.Request) {
 	state := getPositionState(symbol)
 
 	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/ma/ma2-above-ma3")
-
 	log.Printf("📊 MA#2 above MA#3 for %s", symbol)
 
 	mu.Lock()
@@ -3399,11 +4467,8 @@ func handleMA2AboveMA3(w http.ResponseWriter, r *http.Request) {
 	state.MA2BelowMA3 = false
 	mu.Unlock()
 
-	// Only allow LONG entry if reversal requirement met
-	canEnterLong := !state.PositionOpen && (state.LastClosedDirection == "" || state.LastClosedDirection == "short" || state.OppositeDirectionOccurred)
-
 	// Check if we should open LONG position
-	if shouldOpenPosition(symbol, true, r) && canEnterLong {
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
 		openLongPosition(symbol, event.Close)
 		respondSuccess(w, "MA#2 above MA#3 + strategy → LONG opened")
@@ -3446,17 +4511,12 @@ func handleMA2BelowMA3(w http.ResponseWriter, r *http.Request) {
 	state := getPositionState(symbol)
 
 	// Track if this is an opposite direction condition
-	trackOppositeDirection(symbol, "/webhook/ma/ma2-below-ma3")
-
 	log.Printf("📊 MA#2 below MA#3 for %s", symbol)
 
 	mu.Lock()
 	state.MA2BelowMA3 = true
 	state.MA2AboveMA3 = false
 	mu.Unlock()
-
-	// Only allow SHORT entry if reversal requirement met
-	canEnterShort := !state.PositionOpen && (state.LastClosedDirection == "" || state.LastClosedDirection == "long" || state.OppositeDirectionOccurred)
 
 	// Check if we should open LONG position (shouldn't happen with MA2 below MA3, but keep for consistency)
 	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
@@ -3467,7 +4527,7 @@ func handleMA2BelowMA3(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we should open SHORT position
-	if shouldOpenPosition(symbol, false, r) && canEnterShort {
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
 		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
 		openShortPosition(symbol, event.Close)
 		respondSuccess(w, "MA#2 below MA#3 + strategy → SHORT opened")
@@ -3475,6 +4535,108 @@ func handleMA2BelowMA3(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondSuccess(w, "MA#2 below MA#3 condition set")
+}
+
+// POST /webhook/ma/ma1-above-ma4
+func handleMA1AboveMA4(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ma/ma1-above-ma4") {
+		log.Printf("⏭️  [WEBHOOK] MA#1 Above MA#4 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MA#1 Above MA#4 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	log.Printf("📊 MA#1 above MA#4 for %s", symbol)
+
+	mu.Lock()
+	state.MA1AboveMA4 = true
+	state.MA1BelowMA4 = false
+	mu.Unlock()
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 above MA#4 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 above MA#4 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MA#1 above MA#4 condition set")
+}
+
+// POST /webhook/ma/ma1-below-ma4
+func handleMA1BelowMA4(w http.ResponseWriter, r *http.Request) {
+	if !isWebhookUsedInStrategy("/webhook/ma/ma1-below-ma4") {
+		log.Printf("⏭️  [WEBHOOK] MA#1 Below MA#4 not used in current strategy - ignoring")
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received MA#1 Below MA#4 event")
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	// Track if this is an opposite direction condition
+	log.Printf("📊 MA#1 below MA#4 for %s", symbol)
+
+	mu.Lock()
+	state.MA1BelowMA4 = true
+	state.MA1AboveMA4 = false
+	mu.Unlock()
+
+	// Check if we should open LONG position
+	if shouldOpenPosition(symbol, true, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening LONG position")
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 below MA#4 + strategy → LONG opened")
+		return
+	}
+
+	// Check if we should open SHORT position
+	if shouldOpenPosition(symbol, false, r) && !state.PositionOpen {
+		log.Printf("✅ [TRADE] Strategy conditions met! Opening SHORT position")
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, "MA#1 below MA#4 + strategy → SHORT opened")
+		return
+	}
+
+	respondSuccess(w, "MA#1 below MA#4 condition set")
 }
 
 // ============================================================================
@@ -4946,6 +6108,252 @@ func getCurrentPrice(symbol string) (float64, error) {
 	return price, nil
 }
 
+// Get unrealized P/L for an open trade from OANDA
+// Returns the unrealized P/L in account currency (typically USD)
+func getOandaTradeUnrealizedPL(tradeID string) (float64, error) {
+	if tradeID == "" {
+		return 0, fmt.Errorf("no trade ID provided")
+	}
+
+	url := fmt.Sprintf("%s/v3/accounts/%s/trades/%s", oandaBaseURL, oandaAccountID, tradeID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch trade: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("OANDA API returned status %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	trade, ok := result["trade"].(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("invalid trade data")
+	}
+
+	// OANDA returns unrealizedPL as a string
+	unrealizedPLStr, ok := trade["unrealizedPL"].(string)
+	if !ok {
+		return 0, fmt.Errorf("no unrealized P/L in response")
+	}
+
+	unrealizedPL := 0.0
+	fmt.Sscanf(unrealizedPLStr, "%f", &unrealizedPL)
+	return unrealizedPL, nil
+}
+
+// Get realized P/L from a closed trade (used when position is closed)
+func getOandaTradeRealizedPL(tradeID string) (float64, error) {
+	if tradeID == "" {
+		return 0, fmt.Errorf("no trade ID provided")
+	}
+
+	// Query the transactions endpoint to find the close transaction
+	url := fmt.Sprintf("%s/v3/accounts/%s/transactions", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Get recent transactions
+	q := req.URL.Query()
+	q.Add("count", "100")
+	req.URL.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch transactions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("OANDA API returned status %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	transactions, ok := result["transactions"].([]interface{})
+	if !ok {
+		return 0, fmt.Errorf("no transactions found")
+	}
+
+	// Look for ORDER_FILL transaction that closed this trade
+	for _, txn := range transactions {
+		txnMap, ok := txn.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Check if this transaction involves our trade
+		if tradesClosed, ok := txnMap["tradesClosed"].([]interface{}); ok {
+			for _, closedTrade := range tradesClosed {
+				closedTradeMap, ok := closedTrade.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if closedTradeMap["tradeID"] == tradeID {
+					// Found the close transaction for our trade
+					if realizedPLStr, ok := closedTradeMap["realizedPL"].(string); ok {
+						realizedPL := 0.0
+						fmt.Sscanf(realizedPLStr, "%f", &realizedPL)
+						return realizedPL, nil
+					}
+				}
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("could not find close transaction for trade %s", tradeID)
+}
+
+// Update position state with real-time P/L from OANDA
+// Called on webhook events to refresh P/L data
+func updateOandaPositionPL(symbol string) {
+	mu.RLock()
+	state, exists := positions[symbol]
+	if !exists || !state.PositionOpen || state.IsSimulated || state.TradeID == "" {
+		mu.RUnlock()
+		return
+	}
+	tradeID := state.TradeID
+	mu.RUnlock()
+
+	unrealizedPL, err := getOandaTradeUnrealizedPL(tradeID)
+	if err != nil {
+		log.Printf("⚠️  [P/L] Failed to fetch P/L for %s (ID: %s): %v", symbol, tradeID, err)
+		return
+	}
+
+	mu.Lock()
+	state.OandaUnrealizedPL = fmt.Sprintf("%.2f", unrealizedPL)
+	mu.Unlock()
+
+	// Log P/L update
+	plColor := "🟢"
+	plSign := "+"
+	if unrealizedPL < 0 {
+		plColor = "🔴"
+		plSign = ""
+	}
+	log.Printf("💰 [OANDA P/L] %s %s: %s%s$%.2f", plColor, symbol, plSign, "", unrealizedPL)
+}
+
+// Get all open positions with their P/L from OANDA
+// Returns a map of symbol -> P/L details
+func getOandaOpenPositionsPL() map[string]map[string]interface{} {
+	result := make(map[string]map[string]interface{})
+
+	url := fmt.Sprintf("%s/v3/accounts/%s/openTrades", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("⚠️  [P/L] Failed to fetch open trades: %v", err)
+		return result
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("⚠️  [P/L] OANDA API returned status %d", resp.StatusCode)
+		return result
+	}
+
+	var apiResult map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&apiResult); err != nil {
+		log.Printf("⚠️  [P/L] Failed to parse response: %v", err)
+		return result
+	}
+
+	trades, ok := apiResult["trades"].([]interface{})
+	if !ok {
+		return result
+	}
+
+	for _, trade := range trades {
+		tradeMap, ok := trade.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		instrument, _ := tradeMap["instrument"].(string)
+		if instrument == "" {
+			continue
+		}
+
+		result[instrument] = map[string]interface{}{
+			"tradeID":       tradeMap["id"],
+			"unrealizedPL":  tradeMap["unrealizedPL"],
+			"currentUnits":  tradeMap["currentUnits"],
+			"price":         tradeMap["price"],
+			"openTime":      tradeMap["openTime"],
+			"initialMargin": tradeMap["initialMarginRequired"],
+		}
+	}
+
+	return result
+}
+
+// Check if daily profit target has been reached and disable trading if so
+func checkDailyProfitTarget() {
+	if !dailyProfitTargetEnabled || dailyProfitTargetReached {
+		return
+	}
+
+	// Check if we need to reset the daily counter (new day)
+	now := getLocalTime()
+	if now.YearDay() != dailyProfitResetTime.YearDay() || now.Year() != dailyProfitResetTime.Year() {
+		mu.Lock()
+		dailyRealizedProfit = 0
+		dailyProfitTargetReached = false
+		dailyProfitResetTime = now
+		mu.Unlock()
+		log.Printf("🔄 [DAILY] New trading day - daily profit counter reset to $0.00")
+	}
+
+	if dailyRealizedProfit >= dailyProfitTarget {
+		mu.Lock()
+		dailyProfitTargetReached = true
+		strategyEnabled = false
+		mu.Unlock()
+		log.Println(strings.Repeat("💰", 40))
+		log.Printf("🎯 [DAILY PROFIT] Target reached! Today's profit: $%.2f (Target: $%.2f)", dailyRealizedProfit, dailyProfitTarget)
+		log.Printf("🛑 [DAILY PROFIT] Trading DISABLED for the rest of the day")
+		log.Printf("   Re-enable manually via /enable-strategy or wait for new trading day")
+		log.Println(strings.Repeat("💰", 40))
+	}
+}
+
+// Add realized profit to daily total (called when position is closed)
+func addDailyRealizedProfit(profit float64) {
+	mu.Lock()
+	dailyRealizedProfit += profit
+	mu.Unlock()
+
+	log.Printf("💵 [DAILY] Added $%.2f to daily profit. Today's total: $%.2f", profit, dailyRealizedProfit)
+
+	// Check if target reached
+	checkDailyProfitTarget()
+}
+
 // Calculate units from USD amount
 func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	log.Printf("💱 [CALCULATE] Converting $%.2f USD to units for %s", usdAmount, symbol)
@@ -4974,8 +6382,9 @@ func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 
 // Calculate price move needed to achieve a specific dollar amount P&L
 // Accounts for currency conversion factors from OANDA
-func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDollars float64, units int, isLong bool) (float64, error) {
+func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDollars float64, units int, isGain bool) (float64, error) {
 	// Get pricing info from OANDA which includes homeConversionFactors
+	// isGain: true for take profit (use gainQuoteHome), false for stop loss (use lossQuoteHome)
 	url := fmt.Sprintf("%s/v3/accounts/%s/pricing?instruments=%s", oandaBaseURL, oandaAccountID, symbol)
 
 	req, _ := http.NewRequest("GET", url, nil)
@@ -5010,11 +6419,11 @@ func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDol
 		return targetDollars / float64(units), nil
 	}
 
-	// For LONG positions, we use gainQuoteHome (quote currency gain -> home currency)
-	// For SHORT positions, we use lossQuoteHome (quote currency gain -> home currency)
-	// These account for the current exchange rates
+	// For gains (take profit), we use gainQuoteHome (converts positive P&L to home currency)
+	// For losses (stop loss), we use lossQuoteHome (converts negative P&L to home currency)
+	// These account for the current exchange rates and bid/ask spread
 	var conversionFactor float64
-	if isLong {
+	if isGain {
 		gainFactorStr, ok := homeConversion["gainQuoteHome"].(string)
 		if ok {
 			fmt.Sscanf(gainFactorStr, "%f", &conversionFactor)
@@ -5054,7 +6463,8 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, un
 		fmt.Sscanf(takeProfitDollars, "%f", &dollars)
 
 		// Query OANDA for accurate conversion factor
-		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, isLong)
+		// Take profit is always a gain, so use isGain=true to get gainQuoteHome factor
+		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, true)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get accurate conversion, using simple calculation: %v", err)
 			// Fallback to simple calculation (works for XXX_USD pairs)
@@ -5133,7 +6543,8 @@ func calculateStopLossPrice(symbol string, entryPrice float64, isLong bool, unit
 		fmt.Sscanf(stopLossDollars, "%f", &dollars)
 
 		// Query OANDA for accurate conversion factor
-		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, !isLong)
+		// Stop loss is always a loss, so use isGain=false to get lossQuoteHome factor
+		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, false)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get accurate conversion, using simple calculation: %v", err)
 			// Fallback to simple calculation (works for XXX_USD pairs)
@@ -5440,6 +6851,84 @@ func queryTradeCloseReason(tradeID string) (string, error) {
 	return "UNKNOWN", nil
 }
 
+// queryTradeCloseDetails returns both the close reason and the realized P/L for a closed trade
+func queryTradeCloseDetails(tradeID string) (reason string, realizedPL float64, err error) {
+	// Get recent transactions for this account
+	url := fmt.Sprintf("%s/v3/accounts/%s/transactions", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	q := req.URL.Query()
+	q.Add("count", "100")
+	req.URL.RawQuery = q.Encode()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "UNKNOWN", 0, fmt.Errorf("failed to fetch transactions: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "UNKNOWN", 0, fmt.Errorf("failed to parse transactions: %v", err)
+	}
+
+	transactions, ok := result["transactions"].([]interface{})
+	if !ok {
+		return "UNKNOWN", 0, fmt.Errorf("no transactions found")
+	}
+
+	// Look for the ORDER_FILL transaction that closed this trade
+	for i := len(transactions) - 1; i >= 0; i-- {
+		txn, ok := transactions[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		txnType, _ := txn["type"].(string)
+		if txnType != "ORDER_FILL" {
+			continue
+		}
+
+		tradesClosed, ok := txn["tradesClosed"].([]interface{})
+		if !ok || len(tradesClosed) == 0 {
+			continue
+		}
+
+		for _, tc := range tradesClosed {
+			tcMap, ok := tc.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			closedTradeID, _ := tcMap["tradeID"].(string)
+			if closedTradeID == tradeID {
+				// Found the close transaction
+				txnReason, _ := txn["reason"].(string)
+
+				// Get realized P/L from the trade close details
+				if plStr, ok := tcMap["realizedPL"].(string); ok {
+					fmt.Sscanf(plStr, "%f", &realizedPL)
+				}
+
+				// Determine close reason
+				if txnReason == "TAKE_PROFIT_ORDER" || strings.Contains(txnReason, "TAKE_PROFIT") {
+					return "TAKE_PROFIT", realizedPL, nil
+				} else if txnReason == "STOP_LOSS_ORDER" || strings.Contains(txnReason, "STOP_LOSS") {
+					return "STOP_LOSS", realizedPL, nil
+				} else {
+					return "MANUAL", realizedPL, nil
+				}
+			}
+		}
+	}
+
+	return "UNKNOWN", 0, nil
+}
+
 // Check if any bot positions have been closed by OANDA (TP/SL hit)
 func checkClosedPositions() {
 	mu.RLock()
@@ -5499,11 +6988,16 @@ func checkClosedPositions() {
 	// Check if any bot positions are no longer in OANDA
 	for _, botTrade := range botOpenTrades {
 		if !oandaTradeIDs[botTrade.tradeID] {
-			// Trade was closed by OANDA - determine why
-			closeReason, err := queryTradeCloseReason(botTrade.tradeID)
+			// Trade was closed by OANDA - get close reason and realized P/L
+			closeReason, realizedPL, err := queryTradeCloseDetails(botTrade.tradeID)
 			if err != nil {
-				log.Printf("⚠️  [CHECK] Could not determine close reason for %s: %v", botTrade.tradeID, err)
+				log.Printf("⚠️  [CHECK] Could not determine close details for %s: %v", botTrade.tradeID, err)
 				closeReason = "UNKNOWN"
+			}
+
+			// Track daily profit if enabled
+			if dailyProfitTargetEnabled && realizedPL != 0 {
+				addDailyRealizedProfit(realizedPL)
 			}
 
 			mu.Lock()
@@ -5514,6 +7008,7 @@ func checkClosedPositions() {
 			state.PositionOpen = false
 			state.Position = ""
 			state.TradeID = ""
+			state.OandaRealizedPL = fmt.Sprintf("%.2f", realizedPL)
 			state.EntryConditionsCompleted = make(map[string]bool)
 			state.ExitConditionsCompleted = make(map[string]bool)
 			resetIndicatorStates(state)
@@ -5529,12 +7024,20 @@ func checkClosedPositions() {
 			mu.Unlock()
 
 			// Log based on closure reason
+			plColor := "🟢"
+			plSign := "+"
+			if realizedPL < 0 {
+				plColor = "🔴"
+				plSign = ""
+			}
+
 			if closeReason == "TAKE_PROFIT" {
 				log.Println(strings.Repeat("🎯", 40))
 				log.Printf("🎯 TAKE PROFIT HIT - %s %s", strings.ToUpper(positionType), botTrade.symbol)
 				log.Println(strings.Repeat("🎯", 40))
 				log.Printf("Trade ID: %s", botTrade.tradeID)
 				log.Printf("Target: $%s profit", takeProfitDollars)
+				log.Printf("💰 Realized P/L: %s %s$%.2f", plColor, plSign, realizedPL)
 				log.Println(strings.Repeat("🎯", 40))
 				log.Printf("✅ Position closed automatically by OANDA")
 			} else if closeReason == "STOP_LOSS" {
@@ -5543,11 +7046,12 @@ func checkClosedPositions() {
 				log.Println(strings.Repeat("🛑", 40))
 				log.Printf("Trade ID: %s", botTrade.tradeID)
 				log.Printf("Loss limit: $%s", stopLossDollars)
+				log.Printf("💰 Realized P/L: %s %s$%.2f", plColor, plSign, realizedPL)
 				log.Println(strings.Repeat("🛑", 40))
 				log.Printf("✅ Position closed automatically by OANDA")
 			} else {
-				log.Printf("ℹ️  [SYNC] Position closed in OANDA: %s %s (ID: %s, Reason: %s)",
-					strings.ToUpper(positionType), botTrade.symbol, botTrade.tradeID, closeReason)
+				log.Printf("ℹ️  [SYNC] Position closed in OANDA: %s %s (ID: %s, Reason: %s, P/L: %s%s$%.2f)",
+					strings.ToUpper(positionType), botTrade.symbol, botTrade.tradeID, closeReason, plSign, "", realizedPL)
 			}
 
 			log.Printf("💾 [STATE] Position updated - Open=false, Type='', TradeID='', Flags cleared")
@@ -5557,18 +7061,25 @@ func checkClosedPositions() {
 
 // Reset all indicator states for a symbol (requires fresh webhooks to re-enter)
 func resetIndicatorStates(state *PositionState) {
+	// NOTE: We no longer reset indicator states on position close.
+	// Indicator states (like PriceAboveEMA200, RSIAbove50, etc.) reflect actual market conditions
+	// that don't change just because a position was closed. Higher timeframe indicators (4H)
+	// take a long time to get new events, so clearing them causes unnecessary delays.
+	//
+	// We only reset entry/exit condition tracking to require fresh confirmation.
+
+	// Clear entry/exit condition tracking to require fresh webhook confirmation
+	state.EntryConditionsCompleted = make(map[string]bool)
+	state.ExitConditionsCompleted = make(map[string]bool)
+
+	// Reset one-time cross/event flags that should only trigger once per setup
+	// These are events that happened in the past and shouldn't carry over
 	state.MACDCrossedUp = false
 	state.MACDCrossedDown = false
-	state.StochInOversold = false
-	state.StochInOverbought = false
-	state.StochRSICrossedUp20 = false
-	state.StochRSICrossedDown20 = false
-	state.StochRSICrossedUp50 = false
-	state.StochRSICrossedDown50 = false
-	state.StochRSICrossedUp80 = false
-	state.StochRSICrossedDown80 = false
-	state.RSIAbove50 = false
-	state.RSIBelow50 = false
+	state.EMA9CrossedUpEMA21 = false
+	state.EMA9CrossedDownEMA21 = false
+	state.MA1CrossedAboveMA2 = false
+	state.MA1CrossedBelowMA2 = false
 	state.RSICrossedUp25 = false
 	state.RSICrossedDown25 = false
 	state.RSICrossedUp30 = false
@@ -5581,82 +7092,95 @@ func resetIndicatorStates(state *PositionState) {
 	state.RSICrossedDown70 = false
 	state.RSICrossedUp75 = false
 	state.RSICrossedDown75 = false
-	state.PriceAboveEMA9 = false
-	state.PriceBelowEMA9 = false
-	state.PriceAboveEMA50 = false
-	state.PriceBelowEMA50 = false
-	state.PriceAboveEMA20 = false
-	state.PriceBelowEMA20 = false
-	state.PriceAboveEMA200 = false
-	state.PriceBelowEMA200 = false
-	state.EMA9CrossedUpEMA21 = false
-	state.EMA9CrossedDownEMA21 = false
-	state.EMA9AboveEMA21 = false
-	state.EMA9BelowEMA21 = false
-	state.EMA9EMA21StateInitialized = false
-	state.MA2AboveMA3 = false
-	state.MA2BelowMA3 = false
-	state.ATRAboveAverage = false
-	state.ATRBelowAverage = false
-	state.MACDHistIncreasing = false
-	state.MACDHistDecreasing = false
-	state.MACDHistAboveZero = false
-	state.MACDHistBelowZero = false
-	state.MARibbonBullish = false
-	state.MARibbonBearish = false
-	state.SMCLowLow = false
-	state.SMCHighLow = false
-	state.SMCLowHigh = false
-	state.SMCHighHigh = false
+	state.StochRSICrossedUp20 = false
+	state.StochRSICrossedDown20 = false
+	state.StochRSICrossedUp50 = false
+	state.StochRSICrossedDown50 = false
+	state.StochRSICrossedUp80 = false
+	state.StochRSICrossedDown80 = false
 
-	// Also clear entry/exit condition tracking since indicators are reset
-	state.EntryConditionsCompleted = make(map[string]bool)
-	state.ExitConditionsCompleted = make(map[string]bool)
+	// Reset ATR cross flags (require fresh cross for next trade)
+	state.ATRLongCrossed = false
+	state.ATRShortCrossed = false
+
+	// PRESERVED persistent state indicators - these reflect current market conditions:
+	// - PriceAboveEMA200, PriceBelowEMA200 (MA4 - 4H timeframe, takes 4hrs to repopulate)
+	// - PriceAboveEMA50, PriceBelowEMA50
+	// - PriceAboveEMA20, PriceBelowEMA20
+	// - PriceAboveEMA9, PriceBelowEMA9
+	// - RSIAbove50, RSIBelow50
+	// - MACDAboveSignal, MACDBelowSignal
+	// - EMA9AboveEMA21, EMA9BelowEMA21 (MA1/MA2)
+	// - MA2AboveMA3, MA2BelowMA3
+	// - ATRAboveThreshold, ATRBelowThreshold, ATRAboveAverage, ATRBelowAverage
+	// - StochInOversold, StochInOverbought
+	// - MACDHistIncreasing, MACDHistDecreasing, MACDHistAboveZero, MACDHistBelowZero
+	// - MARibbonBullish, MARibbonBearish
+	// - SMCLowLow, SMCHighLow, SMCLowHigh, SMCHighHigh
 }
 
 // Fetch existing open positions from OANDA on startup
 func syncPositionsFromOanda() error {
-	log.Printf("🔄 [SYNC] Fetching open positions from OANDA...")
+	return syncPositionsFromOandaWithLogging(true)
+}
+
+// Periodic sync - less verbose logging
+func periodicSyncPositionsFromOanda() error {
+	return syncPositionsFromOandaWithLogging(false)
+}
+
+func syncPositionsFromOandaWithLogging(verbose bool) error {
+	if verbose {
+		log.Printf("🔄 [SYNC] Fetching open positions from OANDA...")
+	}
 
 	url := fmt.Sprintf("%s/v3/accounts/%s/openTrades", oandaBaseURL, oandaAccountID)
-	log.Printf("📤 [OANDA] GET %s", url)
+	if verbose {
+		log.Printf("📤 [OANDA] GET %s", url)
+	}
 
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("❌ [ERROR] Failed to fetch open trades: %v", err)
+		log.Printf("❌ [SYNC] Failed to fetch open trades: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("❌ [ERROR] Failed to parse OANDA response: %v", err)
+		log.Printf("❌ [SYNC] Failed to parse OANDA response: %v", err)
 		return err
 	}
 
-	log.Printf("📥 [OANDA] Response status: %d", resp.StatusCode)
+	if verbose {
+		log.Printf("📥 [OANDA] Response status: %d", resp.StatusCode)
+	}
 
 	if resp.StatusCode != 200 {
-		log.Printf("❌ [ERROR] Failed to fetch positions (status %d)", resp.StatusCode)
-		log.Printf("📄 [RESPONSE] %+v", result)
+		log.Printf("❌ [SYNC] Failed to fetch positions (status %d)", resp.StatusCode)
 		return fmt.Errorf("failed to fetch positions: status %d", resp.StatusCode)
 	}
 
 	trades, ok := result["trades"].([]interface{})
 	if !ok {
-		log.Printf("✅ [SYNC] No open trades found")
-		return nil
+		trades = []interface{}{} // Empty trades list
 	}
 
-	log.Printf("📊 [SYNC] Found %d open trade(s)", len(trades))
+	if verbose {
+		log.Printf("📊 [SYNC] Found %d open trade(s)", len(trades))
+	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	// Build a map of current OANDA positions
+	oandaPositions := make(map[string]struct {
+		tradeID      string
+		positionType string
+		units        string
+	})
 
 	for _, trade := range trades {
 		tradeMap, ok := trade.(map[string]interface{})
@@ -5672,7 +7196,6 @@ func syncPositionsFromOanda() error {
 			continue
 		}
 
-		// Determine if long or short based on units
 		var positionType string
 		if currentUnits[0] == '-' {
 			positionType = "short"
@@ -5680,22 +7203,108 @@ func syncPositionsFromOanda() error {
 			positionType = "long"
 		}
 
-		// Create or update position state
-		if _, exists := positions[instrument]; !exists {
-			positions[instrument] = &PositionState{
-				Symbol: instrument,
-			}
-		}
-
-		positions[instrument].PositionOpen = true
-		positions[instrument].Position = positionType
-		positions[instrument].TradeID = tradeID
-
-		log.Printf("💾 [SYNC] Loaded %s position: %s (ID: %s, Units: %s)",
-			positionType, instrument, tradeID, currentUnits)
+		oandaPositions[instrument] = struct {
+			tradeID      string
+			positionType string
+			units        string
+		}{tradeID, positionType, currentUnits}
 	}
 
-	log.Printf("✅ [SYNC] Position sync complete")
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check for positions that were closed in OANDA (stop loss, take profit, manual close)
+	for symbol, state := range positions {
+		if state.PositionOpen {
+			if _, exists := oandaPositions[symbol]; !exists {
+				// Position was closed in OANDA but we think it's open
+				log.Printf("🔔 [SYNC] Detected position CLOSED in OANDA: %s %s (ID: %s)",
+					strings.ToUpper(state.Position), symbol, state.TradeID)
+				log.Printf("   💡 Position may have been closed by: Stop Loss, Take Profit, or Manual Close")
+
+				// Update local state
+				state.PositionOpen = false
+				state.Position = "none"
+				state.TradeID = ""
+				state.PositionOpening = false
+
+				// Clear entry conditions for potential re-entry
+				state.EntryConditionsCompleted = make(map[string]bool)
+				state.ExitConditionsCompleted = make(map[string]bool)
+
+				// CRITICAL: Reset ATR direction state to prevent false re-entry
+				// When position is closed externally (manual close, SL, TP), we need to
+				// reset the ATR direction tracking so the next ATR signal is treated as
+				// initialization rather than a cross. This prevents the bug where price
+				// whipsaws and briefly crosses the ATR stop then flips back, causing
+				// an unwanted position re-open.
+				state.ATRDirectionInitialized = false
+				state.ATRDirectionLong = false
+				state.ATRLong = false
+				state.ATRShort = false
+				state.ATRLongCrossed = false
+				state.ATRShortCrossed = false
+				state.ATRFlipLong = false
+				state.ATRFlipShort = false
+				log.Printf("   🔄 Reset ATR direction state to prevent false re-entry on whipsaw")
+
+				// If one-trade mode, the strategy should already be disabled
+				// But if position was closed externally, we might want to keep strategy enabled
+				// for manual trades - leave strategy state as is
+			}
+		}
+	}
+
+	// Check for positions opened directly in OANDA
+	for instrument, pos := range oandaPositions {
+		state, exists := positions[instrument]
+		if !exists {
+			// Create new state for this instrument
+			newState := &PositionState{
+				Symbol:                   instrument,
+				PositionOpen:             true,
+				Position:                 pos.positionType,
+				TradeID:                  pos.tradeID,
+				EntryConditionsCompleted: make(map[string]bool),
+				ExitConditionsCompleted:  make(map[string]bool),
+			}
+			positions[instrument] = newState
+			log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA: %s %s (ID: %s, Units: %s)",
+				strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
+		} else if !state.PositionOpen {
+			// We thought position was closed, but it's open in OANDA
+			state.PositionOpen = true
+			state.Position = pos.positionType
+			state.TradeID = pos.tradeID
+			state.PositionOpening = false
+			// If ATR is currently idle, mark this position as opened during idle
+			// so it won't be closed by subsequent idle signals - wait for ATR cross
+			if state.ATRIdle {
+				state.PositionOpenedWhileIdle = true
+				log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA during ATR IDLE: %s %s (ID: %s, Units: %s)",
+					strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
+				log.Printf("   💡 Position will be held until next ATR direction change (long/short cross)")
+			} else {
+				log.Printf("🔔 [SYNC] Detected NEW position opened in OANDA: %s %s (ID: %s, Units: %s)",
+					strings.ToUpper(pos.positionType), instrument, pos.tradeID, pos.units)
+			}
+		} else if state.TradeID != pos.tradeID {
+			// Different trade ID - position was closed and reopened
+			log.Printf("🔔 [SYNC] Detected position REPLACED in OANDA: %s %s (Old ID: %s → New ID: %s)",
+				strings.ToUpper(pos.positionType), instrument, state.TradeID, pos.tradeID)
+			state.TradeID = pos.tradeID
+			state.Position = pos.positionType
+			// If ATR is idle, mark as opened during idle
+			if state.ATRIdle {
+				state.PositionOpenedWhileIdle = true
+				log.Printf("   💡 Position replaced during ATR IDLE - will be held until next ATR direction change")
+			}
+		}
+	}
+
+	if verbose {
+		log.Printf("✅ [SYNC] Position sync complete")
+	}
 	return nil
 }
 
@@ -5703,25 +7312,39 @@ func openLongPosition(symbol string, price string) {
 	mu.Lock()
 	state := positions[symbol]
 
-	// Double-check position isn't already open (race condition protection)
+	// Double-check position isn't already open OR opening (race condition protection)
 	if state.PositionOpen {
 		mu.Unlock()
 		log.Printf("⚠️  [RACE] Position already open for %s - skipping duplicate open request", symbol)
 		return
 	}
+	if state.PositionOpening {
+		mu.Unlock()
+		log.Printf("⚠️  [RACE] Position already opening for %s - skipping duplicate open request", symbol)
+		return
+	}
 
+	// Set PositionOpening flag to block other concurrent open attempts
+	state.PositionOpening = true
 	exchange := state.Exchange
 	mu.Unlock()
 
-	// Determine if this will be a simulated trade
-	isSimulated := exchange != "OANDA" && exchange != ""
+	// Ensure we clear PositionOpening flag on exit (success or failure)
+	defer func() {
+		mu.Lock()
+		positions[symbol].PositionOpening = false
+		mu.Unlock()
+	}()
+
+	// Determine if this will be a simulated trade (forex pairs always use OANDA)
+	isSimulated := !shouldUseOANDA(symbol, exchange)
 
 	// Check if any position is already open on the SAME exchange type
 	mu.RLock()
 	for sym, s := range positions {
 		if s.PositionOpen {
 			// Only block if same exchange type (both OANDA or both simulated)
-			otherIsSimulated := s.Exchange != "OANDA" && s.Exchange != ""
+			otherIsSimulated := !shouldUseOANDA(sym, s.Exchange)
 			if isSimulated == otherIsSimulated {
 				mu.RUnlock()
 				log.Println(strings.Repeat("🚫", 40))
@@ -5746,8 +7369,9 @@ func openLongPosition(symbol string, price string) {
 	exchange = state.Exchange
 	mu.Unlock()
 
-	// Check if this is a non-OANDA exchange (simulated trade)
-	if exchange != "OANDA" && exchange != "" {
+	// Check if this is a non-OANDA symbol (simulated trade)
+	// Forex pairs always use OANDA regardless of exchange field from TradingView
+	if !shouldUseOANDA(symbol, exchange) {
 		// Calculate position size with appropriate leverage for simulation
 		var positionSize float64
 		var positionUnits int
@@ -5755,12 +7379,8 @@ func openLongPosition(symbol string, price string) {
 		// Determine leverage based on symbol type
 		// Forex pairs typically use 50:1, crypto uses 10:1
 		leverage := 10.0 // Default for crypto
-		if strings.Contains(symbol, "_") {
-			parts := strings.Split(symbol, "_")
-			// Check if it's a forex pair (both are 3-letter currency codes)
-			if len(parts) == 2 && len(parts[0]) == 3 && len(parts[1]) == 3 {
-				leverage = 50.0 // Forex leverage
-			}
+		if isForexPair(symbol) {
+			leverage = 50.0 // Forex leverage
 		}
 
 		priceFloat, err := strconv.ParseFloat(price, 64)
@@ -5809,7 +7429,6 @@ func openLongPosition(symbol string, price string) {
 		// Clear entry/exit tracking and reset all indicator states
 		state.EntryConditionsCompleted = make(map[string]bool)
 		state.ExitConditionsCompleted = make(map[string]bool)
-		state.OppositeDirectionOccurred = false // Reset reversal tracking
 		resetIndicatorStates(state)
 		mu.Unlock()
 
@@ -5854,7 +7473,6 @@ func openLongPosition(symbol string, price string) {
 	// Clear entry/exit tracking and reset all indicator states
 	state.EntryConditionsCompleted = make(map[string]bool)
 	state.ExitConditionsCompleted = make(map[string]bool)
-	state.OppositeDirectionOccurred = false // Reset reversal tracking
 	resetIndicatorStates(state)
 	mu.Unlock()
 
@@ -5867,25 +7485,39 @@ func openShortPosition(symbol string, price string) {
 	mu.Lock()
 	state := positions[symbol]
 
-	// Double-check position isn't already open (race condition protection)
+	// Double-check position isn't already open OR opening (race condition protection)
 	if state.PositionOpen {
 		mu.Unlock()
 		log.Printf("⚠️  [RACE] Position already open for %s - skipping duplicate open request", symbol)
 		return
 	}
+	if state.PositionOpening {
+		mu.Unlock()
+		log.Printf("⚠️  [RACE] Position already opening for %s - skipping duplicate open request", symbol)
+		return
+	}
 
+	// Set PositionOpening flag to block other concurrent open attempts
+	state.PositionOpening = true
 	exchange := state.Exchange
 	mu.Unlock()
 
-	// Determine if this will be a simulated trade
-	isSimulated := exchange != "OANDA" && exchange != ""
+	// Ensure we clear PositionOpening flag on exit (success or failure)
+	defer func() {
+		mu.Lock()
+		positions[symbol].PositionOpening = false
+		mu.Unlock()
+	}()
+
+	// Determine if this will be a simulated trade (forex pairs always use OANDA)
+	isSimulated := !shouldUseOANDA(symbol, exchange)
 
 	// Check if any position is already open on the SAME exchange type
 	mu.RLock()
 	for sym, s := range positions {
 		if s.PositionOpen {
 			// Only block if same exchange type (both OANDA or both simulated)
-			otherIsSimulated := s.Exchange != "OANDA" && s.Exchange != ""
+			otherIsSimulated := !shouldUseOANDA(sym, s.Exchange)
 			if isSimulated == otherIsSimulated {
 				mu.RUnlock()
 				log.Println(strings.Repeat("🚫", 40))
@@ -5908,8 +7540,11 @@ func openShortPosition(symbol string, price string) {
 	mu.Lock()
 	state = positions[symbol]
 	exchange = state.Exchange
-	mu.Unlock() // Check if this is a non-OANDA exchange (simulated trade)
-	if exchange != "OANDA" && exchange != "" {
+	mu.Unlock()
+
+	// Check if this is a non-OANDA symbol (simulated trade)
+	// Forex pairs always use OANDA regardless of exchange field from TradingView
+	if !shouldUseOANDA(symbol, exchange) {
 		// Calculate position size with appropriate leverage for simulation
 		var positionSize float64
 		var positionUnits int
@@ -5917,12 +7552,8 @@ func openShortPosition(symbol string, price string) {
 		// Determine leverage based on symbol type
 		// Forex pairs typically use 50:1, crypto uses 10:1
 		leverage := 10.0 // Default for crypto
-		if strings.Contains(symbol, "_") {
-			parts := strings.Split(symbol, "_")
-			// Check if it's a forex pair (both are 3-letter currency codes)
-			if len(parts) == 2 && len(parts[0]) == 3 && len(parts[1]) == 3 {
-				leverage = 50.0 // Forex leverage
-			}
+		if isForexPair(symbol) {
+			leverage = 50.0 // Forex leverage
 		}
 
 		priceFloat, err := strconv.ParseFloat(price, 64)
@@ -5971,7 +7602,6 @@ func openShortPosition(symbol string, price string) {
 		// Clear entry/exit tracking and reset all indicator states
 		state.EntryConditionsCompleted = make(map[string]bool)
 		state.ExitConditionsCompleted = make(map[string]bool)
-		state.OppositeDirectionOccurred = false // Reset reversal tracking
 		resetIndicatorStates(state)
 		mu.Unlock()
 
@@ -6016,7 +7646,6 @@ func openShortPosition(symbol string, price string) {
 	// Clear entry/exit tracking and reset all indicator states
 	state.EntryConditionsCompleted = make(map[string]bool)
 	state.ExitConditionsCompleted = make(map[string]bool)
-	state.OppositeDirectionOccurred = false // Reset reversal tracking
 	resetIndicatorStates(state)
 	mu.Unlock()
 
@@ -6085,7 +7714,6 @@ func closePosition(symbol string) {
 		log.Println(strings.Repeat("🔵", 40))
 
 		mu.Lock()
-		state.LastClosedDirection = position // Track which direction was closed
 		state.PositionOpen = false
 		state.Position = ""
 		state.TradeID = ""
@@ -6105,28 +7733,13 @@ func closePosition(symbol string) {
 				log.Printf("🧹 [CLEANUP] Cleared entry conditions for %s (position closed on %s)", sym, symbol)
 			}
 		}
+
+		// Disable strategy after completing one trade cycle (if one trade mode enabled)
+		if activeStrategy.OneTradeMode {
+			strategyEnabled = false
+			log.Printf("🛑 [STRATEGY] Strategy DISABLED after completing trade (oneTradeMode=true) - re-enable via /enable-strategy")
+		}
 		mu.Unlock()
-
-		// Check if we should immediately re-enter with reversal protection
-		log.Printf("✅ [EXIT] Position closed - checking if conditions met for re-entry...")
-
-		// Check LONG entry (only if last close was SHORT or opposite direction occurred)
-		canEnterLong := state.LastClosedDirection == "" || state.LastClosedDirection == "short" || state.OppositeDirectionOccurred
-		if canEnterLong && shouldOpenPosition(symbol, true, nil) {
-			log.Printf("✅ [TRADE] LONG entry conditions still met after close + reversal requirement satisfied → Opening LONG")
-			openLongPosition(symbol, state.LatestPrice)
-			return
-		}
-
-		// Check SHORT entry (only if last close was LONG or opposite direction occurred)
-		canEnterShort := state.LastClosedDirection == "" || state.LastClosedDirection == "long" || state.OppositeDirectionOccurred
-		if canEnterShort && shouldOpenPosition(symbol, false, nil) {
-			log.Printf("✅ [TRADE] SHORT entry conditions still met after close + reversal requirement satisfied → Opening SHORT")
-			openShortPosition(symbol, state.LatestPrice)
-			return
-		}
-
-		log.Printf("⏳ [ENTRY] No immediate re-entry: reversal requirement not met or conditions not satisfied")
 
 		return
 	}
@@ -6151,11 +7764,29 @@ func closePosition(symbol string) {
 
 	log.Printf("📥 [OANDA] Response status: %d", resp.StatusCode)
 
+	// Parse response to extract realized P/L
+	var responseBody map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&responseBody)
+
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Extract realized P/L from OANDA response
+		var realizedPL float64
+		if orderFillTxn, ok := responseBody["orderFillTransaction"].(map[string]interface{}); ok {
+			if plStr, ok := orderFillTxn["pl"].(string); ok {
+				fmt.Sscanf(plStr, "%f", &realizedPL)
+				log.Printf("💰 [OANDA] Realized P/L: $%.2f", realizedPL)
+
+				// Track daily profit
+				if dailyProfitTargetEnabled {
+					addDailyRealizedProfit(realizedPL)
+				}
+			}
+		}
+
 		mu.Lock()
-		state.LastClosedDirection = position // Track which direction was closed
 		state.PositionOpen = false
 		state.Position = "none"
+		state.OandaRealizedPL = fmt.Sprintf("%.2f", realizedPL)
 		state.TradeID = ""
 		// Clear exit tracking but KEEP entry condition states (don't clear indicator flags)
 		state.ExitConditionsCompleted = make(map[string]bool)
@@ -6167,39 +7798,19 @@ func closePosition(symbol string) {
 				log.Printf("🧹 [CLEANUP] Cleared entry conditions for %s (position closed on %s)", sym, symbol)
 			}
 		}
+
+		// Disable strategy after completing one trade cycle (if one trade mode enabled)
+		if activeStrategy.OneTradeMode {
+			strategyEnabled = false
+		}
 		mu.Unlock()
 
 		log.Printf("✅ Position closed: %s", symbol)
 		log.Printf("💾 [STATE] Position updated - Open=%v, Type=%s", state.PositionOpen, state.Position)
-
-		// Check if we should immediately re-enter with reversal protection
-		log.Printf("🔍 [ENTRY] Checking if conditions met for re-entry with reversal protection...")
-
-		// Check LONG entry (only if last close was SHORT or opposite direction occurred)
-		canEnterLong := state.LastClosedDirection == "" || state.LastClosedDirection == "short" || state.OppositeDirectionOccurred
-		if canEnterLong && shouldOpenPosition(symbol, true, nil) {
-			log.Printf("✅ [TRADE] LONG entry conditions met + reversal requirement satisfied → Opening LONG")
-			openLongPosition(symbol, "")
-		} else if !canEnterLong && shouldOpenPosition(symbol, true, nil) {
-			log.Printf("🚫 [BLOCKED] LONG conditions met but reversal requirement not satisfied (last close: %s, opposite occurred: %v)", state.LastClosedDirection, state.OppositeDirectionOccurred)
-		}
-
-		// Check SHORT entry (only if last close was LONG or opposite direction occurred)
-		canEnterShort := state.LastClosedDirection == "" || state.LastClosedDirection == "long" || state.OppositeDirectionOccurred
-		if canEnterShort && shouldOpenPosition(symbol, false, nil) {
-			log.Printf("✅ [TRADE] SHORT entry conditions met + reversal requirement satisfied → Opening SHORT")
-			openShortPosition(symbol, "")
-		} else if !canEnterShort && shouldOpenPosition(symbol, false, nil) {
-			log.Printf("🚫 [BLOCKED] SHORT conditions met but reversal requirement not satisfied (last close: %s, opposite occurred: %v)", state.LastClosedDirection, state.OppositeDirectionOccurred)
-		}
-
-		if !shouldOpenPosition(symbol, true, nil) && !shouldOpenPosition(symbol, false, nil) {
-			log.Printf("⏳ [ENTRY] No entry conditions met yet")
+		if activeStrategy.OneTradeMode {
+			log.Printf("🛑 [STRATEGY] Strategy DISABLED after completing trade (oneTradeMode=true) - re-enable via /enable-strategy")
 		}
 	} else {
-		// Read response body for error details
-		var responseBody map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&responseBody)
 		log.Printf("❌ Failed to close position (status %d)", resp.StatusCode)
 		log.Printf("📄 [RESPONSE] %+v", responseBody)
 	}
@@ -6367,6 +7978,9 @@ func formatTimeWithZone(t time.Time) string {
 }
 
 func respondSuccess(w http.ResponseWriter, message string) {
+	// Check if trading hours just opened and execute any pending positions
+	checkTradingHoursTransition()
+
 	// Show status report after each webhook event
 	reportStrategyStatus()
 
@@ -6375,6 +7989,53 @@ func respondSuccess(w http.ResponseWriter, message string) {
 		"status":  "success",
 		"message": message,
 	})
+}
+
+// checkTradingHoursTransition checks if trading hours just opened and logs the transition
+func checkTradingHoursTransition() {
+	if !tradingHoursEnabled {
+		return
+	}
+
+	currentlyWithinHours := isWithinTradingHours()
+
+	// Detect transition from closed to open
+	if currentlyWithinHours && !wasWithinTradingHours {
+		log.Printf("\n" + strings.Repeat("=", 80))
+		log.Printf("🔔 TRADING HOURS OPENED - %s", getActiveSessionName())
+		log.Printf("   New positions now allowed. Waiting for fresh entry signals...")
+		log.Printf(strings.Repeat("=", 80) + "\n")
+
+		// Reset ALL ATR state so first signal initializes, second signal triggers
+		// This prevents whipsaw trading when hours open with stale state
+		mu.Lock()
+		for _, state := range positions {
+			// Reset direction tracking (for flip detection)
+			state.ATRDirectionInitialized = false
+			state.ATRFlipLong = false
+			state.ATRFlipShort = false
+			// Reset ATR state (for idle-aware long/short)
+			// This ensures first signal after hours open is treated as initialization
+			state.ATRLong = false
+			state.ATRShort = false
+			state.ATRIdle = false
+			state.ATRLongCrossed = false
+			state.ATRShortCrossed = false
+			log.Printf("   🔄 Reset ATR state for %s (will wait for fresh cross)", state.Symbol)
+		}
+		mu.Unlock()
+	}
+
+	// Detect transition from open to closed
+	if !currentlyWithinHours && wasWithinTradingHours {
+		log.Printf("\n" + strings.Repeat("=", 80))
+		log.Printf("🔒 TRADING HOURS CLOSED - New positions blocked")
+		log.Printf("   Exit signals still processed. Entry conditions continue to be tracked.")
+		log.Printf(strings.Repeat("=", 80) + "\n")
+	}
+
+	// Update the tracking variable
+	wasWithinTradingHours = currentlyWithinHours
 }
 
 // GET /health
@@ -6390,11 +8051,122 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 // GET /status
 func statusHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RLock()
-	defer mu.RUnlock()
+	enabled := strategyEnabled
+	dailyProfit := dailyRealizedProfit
+	dailyTarget := dailyProfitTarget
+	dailyTargetEnabled := dailyProfitTargetEnabled
+	dailyTargetReached := dailyProfitTargetReached
+	mu.RUnlock()
+
+	// Fetch real-time P/L from OANDA for open positions
+	oandaPL := getOandaOpenPositionsPL()
+
+	// Build response with enhanced P/L data
+	response := map[string]interface{}{
+		"positions":       positions,
+		"strategyEnabled": enabled,
+		"oneTradeMode":    activeStrategy.OneTradeMode,
+		"strategyName":    activeStrategy.Name,
+		"oandaPositions":  oandaPL,
+	}
+
+	// Add daily profit tracking if enabled
+	if dailyTargetEnabled {
+		response["dailyProfit"] = map[string]interface{}{
+			"realized":      fmt.Sprintf("%.2f", dailyProfit),
+			"target":        fmt.Sprintf("%.2f", dailyTarget),
+			"targetReached": dailyTargetReached,
+			"remaining":     fmt.Sprintf("%.2f", dailyTarget-dailyProfit),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// Enable strategy after manual intervention
+func enableStrategyHandler(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	strategyEnabled = true
+	mu.Unlock()
+
+	log.Printf("✅ [STRATEGY] Strategy ENABLED - webhooks will be processed")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"strategyEnabled": true,
+		"message":         "Strategy enabled",
+	})
+}
+
+// Disable strategy manually
+func disableStrategyHandler(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	strategyEnabled = false
+	mu.Unlock()
+
+	log.Printf("🛑 [STRATEGY] Strategy DISABLED - webhooks will be ignored")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":         true,
+		"strategyEnabled": false,
+		"message":         "Strategy disabled",
+	})
+}
+
+// GET /daily-profit - Get current daily profit stats
+func dailyProfitHandler(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	dailyProfit := dailyRealizedProfit
+	dailyTarget := dailyProfitTarget
+	dailyTargetEnabled := dailyProfitTargetEnabled
+	dailyTargetReached := dailyProfitTargetReached
+	resetTime := dailyProfitResetTime
+	mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if !dailyTargetEnabled {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": false,
+			"message": "Daily profit target not configured. Set DAILY_PROFIT_TARGET env var.",
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":         true,
+		"realized":        fmt.Sprintf("%.2f", dailyProfit),
+		"target":          fmt.Sprintf("%.2f", dailyTarget),
+		"remaining":       fmt.Sprintf("%.2f", dailyTarget-dailyProfit),
+		"targetReached":   dailyTargetReached,
+		"resetTime":       resetTime.Format(time.RFC3339),
+		"percentOfTarget": fmt.Sprintf("%.1f%%", (dailyProfit/dailyTarget)*100),
+	})
+}
+
+// POST /reset-daily-profit - Reset daily profit counter
+func resetDailyProfitHandler(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	dailyRealizedProfit = 0
+	dailyProfitTargetReached = false
+	dailyProfitResetTime = getLocalTime()
+
+	// Also re-enable strategy if it was disabled due to daily target
+	if dailyProfitTargetEnabled {
+		strategyEnabled = true
+	}
+	mu.Unlock()
+
+	log.Printf("🔄 [DAILY] Daily profit counter manually reset to $0.00")
+	log.Printf("✅ [STRATEGY] Strategy re-enabled")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"positions": positions,
+		"success":         true,
+		"message":         "Daily profit reset to $0.00 and strategy re-enabled",
+		"strategyEnabled": true,
+		"dailyProfit":     "0.00",
 	})
 }
 
@@ -6408,6 +8180,13 @@ func reportStrategyStatus() {
 	log.Printf("📊 STRATEGY STATUS REPORT - %s", formatTimeWithZone(getLocalTime()))
 	log.Println(strings.Repeat("=", 80))
 	log.Printf("Strategy: %s", activeStrategy.Name)
+	if tradingHoursEnabled {
+		if isWithinTradingHours() {
+			log.Printf("Trading Hours: ✅ OPEN - %s", getActiveSessionName())
+		} else {
+			log.Printf("Trading Hours: 🔒 CLOSED (new positions blocked)")
+		}
+	}
 	log.Println("")
 
 	mu.RLock()
@@ -6588,16 +8367,15 @@ func reportStrategyStatus() {
 func reportEntryConditions(symbol string, direction string, entryConditions *EntryConditions, prefix string, state *PositionState) {
 	log.Printf("  %s Entry Conditions (%s mode):", direction, entryConditions.Combination)
 
-	metCount := 0
 	totalCount := len(entryConditions.Conditions)
+	metCount := 0
+	readyCount := 0
 
 	for i, condition := range entryConditions.Conditions {
-		// Check if condition is currently met based on actual state, not just completion tracking
 		var isMet bool
 		if condition.Type == "condition" && condition.Webhook != "" {
 			isMet = isConditionCurrentlyMet(condition.Webhook, state)
 		} else {
-			// For groups or unknown types, fall back to completion tracking
 			key := fmt.Sprintf("%scondition_%d", prefix, i)
 			isMet = state.EntryConditionsCompleted[key]
 		}
@@ -6607,20 +8385,48 @@ func reportEntryConditions(symbol string, direction string, entryConditions *Ent
 		}
 
 		status := "❌"
-		if isMet {
+		statusSuffix := ""
+		waitingForCross := false
+
+		if condition.Type == "condition" && condition.Webhook != "" && requiresCrossEvent(condition.Webhook) {
+			// For cross-required conditions
+			hasCrossed := hasCrossedRecently(condition.Webhook, state)
+			if isMet && hasCrossed {
+				// Crossed and met - fully ready
+				status = "✅"
+			} else if isMet && !hasCrossed {
+				// In correct direction but hasn't crossed yet
+				status = "⏳"
+				statusSuffix = " (waiting for cross)"
+				waitingForCross = true
+			}
+			// else stays ❌ (opposite direction)
+		} else if isMet {
 			status = "✅"
 		}
 
+		if isMet && !waitingForCross {
+			readyCount++
+		}
+
 		description := getNodeDescription(&condition)
-		log.Printf("    %s [%d/%d] %s", status, i+1, totalCount, description)
+		log.Printf("    %s [%d/%d] %s%s", status, i+1, totalCount, description, statusSuffix)
 	}
 
 	log.Printf("  Summary: %d/%d conditions met", metCount, totalCount)
 
-	if metCount == totalCount && totalCount > 0 {
+	if readyCount == totalCount && totalCount > 0 {
 		log.Printf("  🎯 READY: All %s entry conditions are satisfied!", direction)
 	} else if metCount > 0 {
-		log.Printf("  ⏳ WAITING: Need %d more condition(s) for %s entry", totalCount-metCount, direction)
+		waitingCount := metCount - readyCount
+		missingCount := totalCount - metCount
+		if waitingCount > 0 && missingCount > 0 {
+			log.Printf("  ⏳ WAITING: Need %d more condition(s) + %d waiting for cross for %s entry", missingCount, waitingCount, direction)
+		} else if waitingCount > 0 {
+			log.Printf("  ⏳ WAITING: %d condition(s) waiting for cross for %s entry", waitingCount, direction)
+		} else {
+			log.Printf("  ⏳ WAITING: Need %d more condition(s) for %s entry", missingCount, direction)
+		}
 	} else {
 		log.Printf("  💤 IDLE: No %s entry conditions met yet", direction)
 	}
@@ -6649,12 +8455,24 @@ func reportExitConditions(symbol string, direction string, exitConditions *ExitC
 		}
 
 		status := "❌"
-		if isMet {
+		statusSuffix := ""
+
+		if condition.Type == "condition" && condition.Webhook != "" && requiresCrossEvent(condition.Webhook) {
+			// For cross-required exit conditions, only show ✅ if actually crossed
+			if isMet && hasCrossedRecently(condition.Webhook, state) {
+				status = "✅"
+			} else if isPendingCross(condition.Webhook, state) {
+				// We're in opposite direction, waiting for cross to exit
+				status = "⏳"
+				statusSuffix = " (waiting for cross)"
+			}
+			// else stays ❌
+		} else if isMet {
 			status = "✅"
 		}
 
 		description := getNodeDescription(&condition)
-		log.Printf("    %s [%d/%d] %s", status, i+1, totalCount, description)
+		log.Printf("    %s [%d/%d] %s%s", status, i+1, totalCount, description, statusSuffix)
 	}
 
 	log.Printf("  Summary: %d/%d conditions met", metCount, totalCount)
@@ -6705,6 +8523,15 @@ func main() {
 		log.Fatal("❌ OANDA_API_KEY and OANDA_ACCOUNT_ID must be set")
 	}
 
+	// Set OANDA API URL based on OANDA_LIVE environment variable
+	if os.Getenv("OANDA_LIVE") == "true" {
+		oandaBaseURL = "https://api-fxtrade.oanda.com"
+		log.Println("� LIVE TRADING MODE - Using production OANDA API")
+	} else {
+		oandaBaseURL = "https://api-fxpractice.oanda.com"
+		log.Println("🧪 PRACTICE MODE - Using demo OANDA API")
+	}
+
 	// Set trade configuration (priority: MARGIN_AMOUNT > TRADE_USD_AMOUNT > TRADE_UNITS)
 	tradeMargin = os.Getenv("MARGIN_AMOUNT")
 	tradeUSDAmount = os.Getenv("TRADE_USD_AMOUNT")
@@ -6720,10 +8547,23 @@ func main() {
 	stopLossPct = os.Getenv("STOP_LOSS_PCT")
 	stopLossDollars = os.Getenv("STOP_LOSS_DOLLARS")
 
+	// Daily profit target configuration
+	dailyProfitTargetStr := os.Getenv("DAILY_PROFIT_TARGET")
+	if dailyProfitTargetStr != "" {
+		if target, err := strconv.ParseFloat(dailyProfitTargetStr, 64); err == nil && target > 0 {
+			dailyProfitTarget = target
+			dailyProfitTargetEnabled = true
+			dailyProfitResetTime = getLocalTime()
+			log.Printf("🎯 Daily Profit Target: $%.2f (trading will stop when reached)", dailyProfitTarget)
+		} else {
+			log.Printf("⚠️  Invalid DAILY_PROFIT_TARGET value '%s', feature disabled", dailyProfitTargetStr)
+		}
+	}
+
 	// Strategy configuration
 	strategyName = os.Getenv("STRATEGY_FILE")
 	if strategyName == "" {
-		strategyName = "default" // Use default strategy if not specified
+		strategyName = "ma_trend_rsi_atr" // Use default strategy if not specified
 	}
 
 	// Timezone configuration
@@ -6738,6 +8578,95 @@ func main() {
 		}
 	} else {
 		timezoneOffset = 0 // Default to UTC
+	}
+
+	// Trading hours configuration
+	tradingStartHourStr := os.Getenv("TRADING_START_HOUR")
+	tradingEndHourStr := os.Getenv("TRADING_END_HOUR")
+	tradingDaysStr := os.Getenv("TRADING_DAYS")
+	tradingTimezoneStr := os.Getenv("TRADING_TIMEZONE")
+
+	// Parse trading hours if specified
+	if tradingStartHourStr != "" || tradingEndHourStr != "" {
+		tradingHoursEnabled = true
+
+		// Parse start time (supports "9" or "9:30" format)
+		if tradingStartHourStr != "" {
+			hour, minute, err := parseTimeString(tradingStartHourStr)
+			if err == nil {
+				tradingStartHour = hour
+				tradingStartMinute = minute
+			} else {
+				log.Printf("⚠️  Invalid TRADING_START_HOUR '%s': %v, using 00:00", tradingStartHourStr, err)
+				tradingStartHour = 0
+				tradingStartMinute = 0
+			}
+		}
+
+		// Parse end time (supports "17" or "16:30" format, default: 24:00)
+		if tradingEndHourStr != "" {
+			hour, minute, err := parseTimeString(tradingEndHourStr)
+			if err == nil {
+				tradingEndHour = hour
+				tradingEndMinute = minute
+			} else {
+				log.Printf("⚠️  Invalid TRADING_END_HOUR '%s': %v, using 24:00", tradingEndHourStr, err)
+				tradingEndHour = 24
+				tradingEndMinute = 0
+			}
+		} else {
+			tradingEndHour = 24
+			tradingEndMinute = 0
+		}
+
+		// Parse trading days
+		if days, err := parseTradingDays(tradingDaysStr); err != nil {
+			log.Printf("⚠️  Invalid TRADING_DAYS '%s': %v, allowing all days", tradingDaysStr, err)
+			tradingDays = nil
+		} else {
+			tradingDays = days
+		}
+
+		// Parse trading timezone
+		if tradingTimezoneStr != "" {
+			if loc, err := time.LoadLocation(tradingTimezoneStr); err == nil {
+				tradingTimezone = loc
+			} else {
+				log.Printf("⚠️  Invalid TRADING_TIMEZONE '%s': %v, using UTC offset", tradingTimezoneStr, err)
+			}
+		}
+
+		// Parse Session 2 (optional)
+		tradingStartHour2Str := os.Getenv("TRADING_START_HOUR_2")
+		tradingEndHour2Str := os.Getenv("TRADING_END_HOUR_2")
+
+		if tradingStartHour2Str != "" && tradingEndHour2Str != "" {
+			session2Enabled = true
+
+			// Parse session 2 start time
+			hour, minute, err := parseTimeString(tradingStartHour2Str)
+			if err == nil {
+				tradingStartHour2 = hour
+				tradingStartMinute2 = minute
+			} else {
+				log.Printf("⚠️  Invalid TRADING_START_HOUR_2 '%s': %v, disabling session 2", tradingStartHour2Str, err)
+				session2Enabled = false
+			}
+
+			// Parse session 2 end time
+			if session2Enabled {
+				hour, minute, err := parseTimeString(tradingEndHour2Str)
+				if err == nil {
+					tradingEndHour2 = hour
+					tradingEndMinute2 = minute
+				} else {
+					log.Printf("⚠️  Invalid TRADING_END_HOUR_2 '%s': %v, disabling session 2", tradingEndHour2Str, err)
+					session2Enabled = false
+				}
+			}
+		}
+
+		log.Printf("🕐 %s", getTradingHoursStatus())
 	}
 
 	// Default to 100 units if nothing specified
@@ -6793,15 +8722,97 @@ func main() {
 		log.Printf("🛑 Stop Loss: None")
 	}
 
+	// Show trading hours settings
+	if tradingHoursEnabled {
+		log.Println("🕐 Trading Hours Configuration:")
+		log.Printf("   Session 1: %s - %s",
+			formatTimeAMPM(tradingStartHour, tradingStartMinute),
+			formatTimeAMPM(tradingEndHour, tradingEndMinute))
+		if session2Enabled {
+			log.Printf("   Session 2: %s - %s",
+				formatTimeAMPM(tradingStartHour2, tradingStartMinute2),
+				formatTimeAMPM(tradingEndHour2, tradingEndMinute2))
+		}
+
+		// Show timezone
+		tzName := "UTC"
+		if tradingTimezone != nil {
+			tzName = tradingTimezone.String()
+		} else if timezoneOffset != 0 {
+			tzName = fmt.Sprintf("UTC%+d", timezoneOffset)
+		}
+
+		// Show days
+		dayNames := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+		var allowedDays []string
+		if len(tradingDays) == 0 {
+			allowedDays = dayNames
+		} else {
+			for _, d := range tradingDays {
+				if d >= 0 && d <= 6 {
+					allowedDays = append(allowedDays, dayNames[d])
+				}
+			}
+		}
+		log.Printf("   Timezone: %s | Days: %s", tzName, strings.Join(allowedDays, ", "))
+
+		if isWithinTradingHours() {
+			log.Printf("   ✅ Status: OPEN - %s", getActiveSessionName())
+		} else {
+			log.Printf("   🔒 Status: CLOSED (new positions blocked)")
+		}
+	} else {
+		log.Printf("🕐 Trading Hours: No restrictions (24/7)")
+	}
+
 	// Sync existing positions from OANDA on startup
 	if err := syncPositionsFromOanda(); err != nil {
 		log.Printf("⚠️  [WARNING] Could not sync positions from OANDA: %v", err)
 		log.Printf("⚠️  [WARNING] Continuing with empty state - be careful of duplicate positions!")
 	}
 
+	// Initialize trading hours state and reset ATR direction state for fresh session
+	// This ensures the first signal after startup/restart initializes state, not trades
+	if tradingHoursEnabled {
+		wasWithinTradingHours = isWithinTradingHours()
+		if wasWithinTradingHours {
+			log.Printf("🔄 [STARTUP] Trading hours OPEN - resetting ATR state for fresh signals")
+			mu.Lock()
+			for _, state := range positions {
+				// Reset direction tracking (for flip detection)
+				state.ATRDirectionInitialized = false
+				state.ATRFlipLong = false
+				state.ATRFlipShort = false
+				// Reset ATR state (for idle-aware long/short)
+				state.ATRLong = false
+				state.ATRShort = false
+				state.ATRIdle = false
+				state.ATRLongCrossed = false
+				state.ATRShortCrossed = false
+			}
+			mu.Unlock()
+		}
+	}
+
+	// Start periodic OANDA sync (every 5 minutes)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := periodicSyncPositionsFromOanda(); err != nil {
+				log.Printf("⚠️  [SYNC] Periodic sync failed: %v", err)
+			}
+		}
+	}()
+	log.Printf("🔄 [SYNC] Periodic OANDA sync enabled (every 5 minutes)")
+
 	// Health & Status
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/status", statusHandler)
+	http.HandleFunc("/enable-strategy", enableStrategyHandler)
+	http.HandleFunc("/disable-strategy", disableStrategyHandler)
+	http.HandleFunc("/daily-profit", dailyProfitHandler)
+	http.HandleFunc("/reset-daily-profit", resetDailyProfitHandler)
 
 	// RSI Specific Level Webhooks
 	http.HandleFunc("/webhook/rsi/cross-up-oversell-25", handleRSICrossUpOversell25)
@@ -6815,6 +8826,15 @@ func main() {
 	// MACD Webhooks
 	http.HandleFunc("/webhook/macd/cross-up", handleMACDCrossUp)
 	http.HandleFunc("/webhook/macd/cross-down", handleMACDCrossDown)
+
+	// ATR Threshold Webhooks
+	http.HandleFunc("/webhook/atr/above-threshold", handleATRAboveThreshold)
+	http.HandleFunc("/webhook/atr/below-threshold", handleATRBelowThreshold)
+	http.HandleFunc("/webhook/atr/flip-long", handleATRFlipLong)
+	http.HandleFunc("/webhook/atr/flip-short", handleATRFlipShort)
+	http.HandleFunc("/webhook/atr/long", handleATRLong)
+	http.HandleFunc("/webhook/atr/short", handleATRShort)
+	http.HandleFunc("/webhook/atr/idle", handleATRIdle)
 
 	// Stochastic Webhooks
 	http.HandleFunc("/webhook/stochastic/oversold", handleStochasticOversold)
@@ -6855,6 +8875,8 @@ func main() {
 	http.HandleFunc("/webhook/ma/ma1-below-ma2", handleMA1BelowMA2) // Position tracking (cross detection)
 	http.HandleFunc("/webhook/ma/ma2-above-ma3", handleMA2AboveMA3) // Position tracking
 	http.HandleFunc("/webhook/ma/ma2-below-ma3", handleMA2BelowMA3) // Position tracking
+	http.HandleFunc("/webhook/ma/ma1-above-ma4", handleMA1AboveMA4) // Position tracking
+	http.HandleFunc("/webhook/ma/ma1-below-ma4", handleMA1BelowMA4) // Position tracking
 
 	// SMC (Smart Money Concept) Structure Webhooks
 	http.HandleFunc("/webhook/smc/low-low", handleSMCLowLow)     // Lower Low (LL)
