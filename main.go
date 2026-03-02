@@ -6423,28 +6423,41 @@ func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDol
 	// For losses (stop loss), we use lossQuoteHome (converts negative P&L to home currency)
 	// These account for the current exchange rates and bid/ask spread
 	var conversionFactor float64
+	factorKey := "lossQuoteHome"
 	if isGain {
-		gainFactorStr, ok := homeConversion["gainQuoteHome"].(string)
-		if ok {
-			fmt.Sscanf(gainFactorStr, "%f", &conversionFactor)
-		}
-	} else {
-		lossFactorStr, ok := homeConversion["lossQuoteHome"].(string)
-		if ok {
-			fmt.Sscanf(lossFactorStr, "%f", &conversionFactor)
-		}
+		factorKey = "gainQuoteHome"
 	}
 
+	// OANDA API v20 returns nested objects: {"gainQuoteHome": {"factor": "1.0"}}
+	if factorObj, ok := homeConversion[factorKey].(map[string]interface{}); ok {
+		if factorStr, ok := factorObj["factor"].(string); ok {
+			fmt.Sscanf(factorStr, "%f", &conversionFactor)
+			log.Printf("💱 [CONVERSION] Using %s factor: %.6f", factorKey, conversionFactor)
+		}
+	} else if factorStr, ok := homeConversion[factorKey].(string); ok {
+		// Fallback: try direct string (older API format)
+		fmt.Sscanf(factorStr, "%f", &conversionFactor)
+		log.Printf("💱 [CONVERSION] Using %s factor (direct): %.6f", factorKey, conversionFactor)
+	}
+
+	// For XXX_USD pairs (quote currency = home currency), factor should be ~1.0
+	// If we can't get the factor, use 1.0 for USD-quoted pairs, otherwise calculate
 	if conversionFactor == 0 {
-		// Fallback
-		return targetDollars / float64(units), nil
+		if strings.HasSuffix(symbol, "_USD") {
+			conversionFactor = 1.0
+			log.Printf("💱 [CONVERSION] Using 1.0 for USD-quoted pair %s", symbol)
+		} else {
+			// For non-USD quoted pairs without a conversion factor, fall back to simple calc
+			log.Printf("⚠️  [WARNING] No conversion factor for %s, using simple calculation", symbol)
+			return targetDollars / float64(units), nil
+		}
 	}
 
 	// P&L in USD = price_move × units × conversionFactor
 	// Therefore: price_move = targetDollars / (units × conversionFactor)
 	priceMove := targetDollars / (float64(units) * conversionFactor)
 
-	log.Printf("💱 [CONVERSION] Factor: %.6f, Price move: %.5f for $%.2f target", conversionFactor, priceMove, targetDollars)
+	log.Printf("💱 [CONVERSION] Factor: %.6f, Price move: %.5f for $%.2f target with %d units", conversionFactor, priceMove, targetDollars, units)
 
 	return priceMove, nil
 }
