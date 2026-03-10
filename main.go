@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -6380,6 +6381,75 @@ func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	return fmt.Sprintf("%d", unitsInt), nil
 }
 
+// getPipValue returns the pip value for an instrument using OANDA's pipLocation
+// e.g., pipLocation=-4 means 1 pip = 0.0001, pipLocation=-2 means 1 pip = 0.01
+func getPipValue(symbol string) (float64, error) {
+	_, pipLocation, err := getInstrumentInfo(symbol)
+	if err != nil {
+		return 0, err
+	}
+	pipValue := math.Pow(10, float64(pipLocation))
+	return pipValue, nil
+}
+
+// getStopLossDistance returns the price distance for pip-based stop loss
+// Returns (distance, precision, error) - distance is used with OANDA's "distance" parameter
+func getStopLossDistance(symbol string) (string, int, error) {
+	if stopLossPips == "" {
+		return "", 0, nil
+	}
+
+	pips := 0.0
+	fmt.Sscanf(stopLossPips, "%f", &pips)
+
+	pipValue, err := getPipValue(symbol)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to get pip value: %v", err)
+	}
+
+	distance := pips * pipValue
+
+	// Determine precision based on pip location
+	_, pipLocation, _ := getInstrumentInfo(symbol)
+	precision := -pipLocation // e.g., pipLocation=-4 means precision=4 (0.0001)
+	if precision < 1 {
+		precision = 5 // fallback
+	}
+
+	log.Printf("🛑 [SL DISTANCE] %.1f pips × %.5f pip value = %.5f distance", pips, pipValue, distance)
+
+	return fmt.Sprintf("%.*f", precision, distance), precision, nil
+}
+
+// getTakeProfitDistance returns the price distance for pip-based take profit
+// Returns (distance, precision, error) - distance is used with OANDA's "distance" parameter
+func getTakeProfitDistance(symbol string) (string, int, error) {
+	if takeProfitPips == "" {
+		return "", 0, nil
+	}
+
+	pips := 0.0
+	fmt.Sscanf(takeProfitPips, "%f", &pips)
+
+	pipValue, err := getPipValue(symbol)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to get pip value: %v", err)
+	}
+
+	distance := pips * pipValue
+
+	// Determine precision based on pip location
+	_, pipLocation, _ := getInstrumentInfo(symbol)
+	precision := -pipLocation
+	if precision < 1 {
+		precision = 5
+	}
+
+	log.Printf("🎯 [TP DISTANCE] %.1f pips × %.5f pip value = %.5f distance", pips, pipValue, distance)
+
+	return fmt.Sprintf("%.*f", precision, distance), precision, nil
+}
+
 // Calculate price move needed to achieve a specific dollar amount P&L
 // Accounts for currency conversion factors from OANDA
 func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDollars float64, units int, isGain bool) (float64, error) {
@@ -6678,7 +6748,20 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 			orderSpec["units"] = unitsStr
 
 			// Add take profit if configured
-			if takeProfitPips != "" || takeProfitPct != "" || takeProfitDollars != "" {
+			if takeProfitPips != "" {
+				// Use distance parameter for pip-based take profit (more accurate)
+				tpDistance, _, err := getTakeProfitDistance(symbol)
+				if err != nil {
+					log.Printf("⚠️  [WARNING] Failed to get take profit distance: %v", err)
+				} else if tpDistance != "" {
+					orderSpec["takeProfitOnFill"] = map[string]interface{}{
+						"distance":    tpDistance,
+						"timeInForce": "GTC",
+					}
+					log.Printf("🎯 [TP] Take profit distance set at %s", tpDistance)
+				}
+			} else if takeProfitPct != "" || takeProfitDollars != "" {
+				// Use price for percentage/dollar-based take profit
 				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, units)
 				if err != nil {
 					log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
@@ -6692,7 +6775,20 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 			}
 
 			// Add stop loss if configured
-			if stopLossPips != "" || stopLossPct != "" || stopLossDollars != "" {
+			if stopLossPips != "" {
+				// Use distance parameter for pip-based stop loss (more accurate)
+				slDistance, _, err := getStopLossDistance(symbol)
+				if err != nil {
+					log.Printf("⚠️  [WARNING] Failed to get stop loss distance: %v", err)
+				} else if slDistance != "" {
+					orderSpec["stopLossOnFill"] = map[string]interface{}{
+						"distance":    slDistance,
+						"timeInForce": "GTC",
+					}
+					log.Printf("🛑 [SL] Stop loss distance set at %s", slDistance)
+				}
+			} else if stopLossPct != "" || stopLossDollars != "" {
+				// Use price for percentage/dollar-based stop loss
 				slPrice, err := calculateStopLossPrice(symbol, price, isLong, units)
 				if err != nil {
 					log.Printf("⚠️  [WARNING] Failed to calculate stop loss: %v", err)
@@ -6747,7 +6843,20 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 	}
 
 	// Add take profit if configured
-	if takeProfitPips != "" || takeProfitPct != "" || takeProfitDollars != "" {
+	if takeProfitPips != "" {
+		// Use distance parameter for pip-based take profit (more accurate)
+		tpDistance, _, err := getTakeProfitDistance(symbol)
+		if err != nil {
+			log.Printf("⚠️  [WARNING] Failed to get take profit distance: %v", err)
+		} else if tpDistance != "" {
+			orderSpec["takeProfitOnFill"] = map[string]interface{}{
+				"distance":    tpDistance,
+				"timeInForce": "GTC",
+			}
+			log.Printf("🎯 [TP] Take profit distance set at %s", tpDistance)
+		}
+	} else if takeProfitPct != "" || takeProfitDollars != "" {
+		// Use price for percentage/dollar-based take profit
 		// Get current price for TP calculation
 		price, err := getCurrentPrice(symbol)
 		if err != nil {
@@ -6767,7 +6876,20 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 	}
 
 	// Add stop loss if configured
-	if stopLossPips != "" || stopLossPct != "" || stopLossDollars != "" {
+	if stopLossPips != "" {
+		// Use distance parameter for pip-based stop loss (more accurate)
+		slDistance, _, err := getStopLossDistance(symbol)
+		if err != nil {
+			log.Printf("⚠️  [WARNING] Failed to get stop loss distance: %v", err)
+		} else if slDistance != "" {
+			orderSpec["stopLossOnFill"] = map[string]interface{}{
+				"distance":    slDistance,
+				"timeInForce": "GTC",
+			}
+			log.Printf("🛑 [SL] Stop loss distance set at %s", slDistance)
+		}
+	} else if stopLossPct != "" || stopLossDollars != "" {
+		// Use price for percentage/dollar-based stop loss
 		// Get current price for SL calculation
 		price, err := getCurrentPrice(symbol)
 		if err != nil {
