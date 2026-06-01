@@ -1,0 +1,374 @@
+//@version=5
+indicator("ATR Trailing Stop + BOS", overlay=true, max_lines_count=500)
+
+// === Entry ATR Settings ===
+atrLength = input.int(14, "ATR Length")
+atrMultiplier = input.float(1.5, "ATR Multiplier")
+
+// === Trade Direction Filter ===
+tradeDirection = input.string("Both", "Trade Direction", options=["Both", "Long Only", "Short Only", "HTF Direction"], tooltip="Both/Long Only/Short Only: fixed direction. HTF Direction: follows the higher timeframe ATR — goes long when HTF is bullish, short when bearish. All modes pass through BOS/Displacement identically.")
+
+// === HTF ATR Settings ===
+htfTimeframe = input.timeframe("60", "HTF Timeframe", tooltip="e.g., 60 = 1H, 240 = 4H. Used when Trade Direction = HTF Direction.")
+htfAtrLength = input.int(14, "HTF ATR Length")
+htfAtrMultiplier = input.float(2.5, "HTF ATR Multiplier")
+showHtfLine = input.bool(false, "Show HTF ATR Line", tooltip="Display the HTF ATR trailing stop line on the chart.")
+showShapeIcons = input.bool(false, "Show State Icons", tooltip="Show triangle/diamond/circle markers for Long/Short/Pending/Idle states.")
+showBosLine = input.bool(false, "Show BOS Level Line", tooltip="Show the dashed BOS target line while pending.")
+showFlipLine = input.bool(false, "Show ATR Flip Line", tooltip="Show the dashed line at the ATR flip level.")
+
+// Mustard yellow — visible on both dark and white backgrounds
+colorPending = color.rgb(230, 180, 0)
+
+// === Entry Settings ===
+requireFlipToEnter = input.bool(true, "Require ATR Flip to Enter", tooltip="When enabled, only enter on entry ATR flip. When disabled, enter immediately when filter aligns.")
+
+// === Break of Structure Settings ===
+enableBos = input.bool(true, "Enable BOS Confirmation", group="Break of Structure", tooltip="Trade only confirms after price breaks recent high/low.")
+bosLookback = input.int(5, "BOS Lookback Bars", minval=2, maxval=20, group="Break of Structure", tooltip="Number of previous bars to find the close level that price must break.")
+bosRequireClose = input.bool(true, "Require Close Beyond Level", group="Break of Structure", tooltip="Candle must close beyond the level.")
+bosRefreshBars = input.int(5, "BOS Refresh Bars", minval=1, maxval=20, group="Break of Structure", tooltip="Recalculate BOS target every N bars while pending.")
+bosRequireDisplacement = input.bool(false, "Require Displacement on BOS", group="Break of Structure", tooltip="BOS candle must have a body larger than average to confirm entry.")
+bosDispMultiplier = input.float(1.3, "Displacement Multiple", minval=1.0, maxval=3.0, step=0.1, group="Break of Structure", tooltip="1.3 = moderate, 1.5 = strict.")
+
+// Exits are handled by the bot's SL/TP — no Pine-side trailing exit.
+// ("net catching fish" approach: entry from ATR/BOS, exit from SL/TP only)
+
+atr = ta.atr(atrLength)
+src = close
+
+candleBody = math.abs(close - open)
+avgBody = ta.sma(candleBody, 20)
+isDisplaced = candleBody >= avgBody * bosDispMultiplier
+
+// ═══════════════════════════════════════════
+// === HTF ATR TRAILING STOP ===
+// ═══════════════════════════════════════════
+
+htfAtr() =>
+    htf_atr = ta.atr(htfAtrLength)
+    htf_src = close
+    var float htf_trailStop = na
+    var int htf_dir = 1
+    htf_trailStopLong = htf_src - htf_atr * htfAtrMultiplier
+    htf_trailStopShort = htf_src + htf_atr * htfAtrMultiplier
+    if htf_dir == 1
+        htf_trailStop := math.max(nz(htf_trailStop, htf_trailStopLong), htf_trailStopLong)
+        if htf_src < htf_trailStop
+            htf_dir := -1
+            htf_trailStop := htf_trailStopShort
+    else
+        htf_trailStop := math.min(nz(htf_trailStop, htf_trailStopShort), htf_trailStopShort)
+        if htf_src > htf_trailStop
+            htf_dir := 1
+            htf_trailStop := htf_trailStopLong
+    [htf_dir, htf_trailStop]
+
+// === Get HTF ATR direction ===
+[htfDir, htfStop] = request.security(syminfo.tickerid, htfTimeframe, htfAtr())
+
+// ═══════════════════════════════════════════
+// === ENTRY TIMEFRAME ATR TRAILING STOP ===
+// ═══════════════════════════════════════════
+
+var float trailStop = na
+var int dir = 1
+var line flipLine = na
+var float crossPrice = na
+
+trailStopLong = src - atr * atrMultiplier
+trailStopShort = src + atr * atrMultiplier
+prevStop = trailStop
+
+if dir == 1
+    trailStop := math.max(nz(trailStop, trailStopLong), trailStopLong)
+    if src < trailStop
+        crossPrice := prevStop
+        dir := -1
+        trailStop := trailStopShort
+else
+    trailStop := math.min(nz(trailStop, trailStopShort), trailStopShort)
+    if src > trailStop
+        crossPrice := prevStop
+        dir := 1
+        trailStop := trailStopLong
+
+// === Direction Filter ===
+// All modes feed into allowLong/allowShort and behave identically through BOS/Displacement.
+// HTF Direction dynamically tracks htfDir — pending/active trades cancel when HTF flips,
+// exactly the same as a Long/Short Only trade cancels on entry ATR flip.
+allowLong  = tradeDirection != "Short Only" and (tradeDirection != "HTF Direction" or htfDir == 1)
+allowShort = tradeDirection != "Long Only"  and (tradeDirection != "HTF Direction" or htfDir == -1)
+
+flipLong = dir == 1 and dir[1] == -1
+flipShort = dir == -1 and dir[1] == 1
+
+// ═══════════════════════════════════════════
+// === TRADE STATE MACHINE ===
+// ═══════════════════════════════════════════
+// 0 = idle, 2 = pending long (BOS), -2 = pending short (BOS), 1 = long, -1 = short
+
+var int tradeState = 0
+var float bosTarget = na
+var int barsInPending = 0
+var line bosLine = na
+
+useStateMachine = requireFlipToEnter or enableBos
+
+if useStateMachine
+    if requireFlipToEnter
+        // ─── FLIP MODE ───
+        if tradeState == 0
+            if flipLong and allowLong
+                if enableBos
+                    tradeState := 2
+                    bosTarget := ta.highest(close[1], bosLookback)
+                    barsInPending := 0
+                else
+                    tradeState := 1
+            else if flipShort and allowShort
+                if enableBos
+                    tradeState := -2
+                    bosTarget := ta.lowest(close[1], bosLookback)
+                    barsInPending := 0
+                else
+                    tradeState := -1
+
+        else if tradeState == 2
+            barsInPending += 1
+            if barsInPending >= bosRefreshBars
+                bosTarget := ta.highest(close[1], bosLookback)
+                barsInPending := 0
+            if flipShort or not allowLong
+                tradeState := 0
+                bosTarget := na
+                barsInPending := 0
+                if flipShort and allowShort
+                    if enableBos
+                        tradeState := -2
+                        bosTarget := ta.lowest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := -1
+            else
+                bosBreak = bosRequireClose ? (close > bosTarget) : (high > bosTarget)
+                dispOk = bosRequireDisplacement ? isDisplaced : true
+                if bosBreak and dispOk
+                    tradeState := 1
+                    barsInPending := 0
+
+        else if tradeState == -2
+            barsInPending += 1
+            if barsInPending >= bosRefreshBars
+                bosTarget := ta.lowest(close[1], bosLookback)
+                barsInPending := 0
+            if flipLong or not allowShort
+                tradeState := 0
+                bosTarget := na
+                barsInPending := 0
+                if flipLong and allowLong
+                    if enableBos
+                        tradeState := 2
+                        bosTarget := ta.highest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := 1
+            else
+                bosBreak = bosRequireClose ? (close < bosTarget) : (low < bosTarget)
+                dispOk = bosRequireDisplacement ? isDisplaced : true
+                if bosBreak and dispOk
+                    tradeState := -1
+                    barsInPending := 0
+
+        else if tradeState == 1
+            if flipShort or not allowLong
+                tradeState := 0
+                bosTarget := na
+                if flipShort and allowShort
+                    if enableBos
+                        tradeState := -2
+                        bosTarget := ta.lowest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := -1
+
+        else if tradeState == -1
+            if flipLong or not allowShort
+                tradeState := 0
+                bosTarget := na
+                if flipLong and allowLong
+                    if enableBos
+                        tradeState := 2
+                        bosTarget := ta.highest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := 1
+
+    else
+        // ─── CONTINUOUS MODE (no flip required) ───
+        if tradeState == 0
+            if dir == 1 and allowLong
+                if enableBos
+                    tradeState := 2
+                    bosTarget := ta.highest(close[1], bosLookback)
+                    barsInPending := 0
+                else
+                    tradeState := 1
+            else if dir == -1 and allowShort
+                if enableBos
+                    tradeState := -2
+                    bosTarget := ta.lowest(close[1], bosLookback)
+                    barsInPending := 0
+                else
+                    tradeState := -1
+
+        else if tradeState == 2
+            barsInPending += 1
+            if barsInPending >= bosRefreshBars
+                bosTarget := ta.highest(close[1], bosLookback)
+                barsInPending := 0
+            if dir != 1 or not allowLong
+                tradeState := 0
+                bosTarget := na
+                barsInPending := 0
+                if dir == -1 and allowShort
+                    if enableBos
+                        tradeState := -2
+                        bosTarget := ta.lowest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := -1
+            else
+                bosBreak = bosRequireClose ? (close > bosTarget) : (high > bosTarget)
+                dispOk = bosRequireDisplacement ? isDisplaced : true
+                if bosBreak and dispOk
+                    tradeState := 1
+                    barsInPending := 0
+
+        else if tradeState == -2
+            barsInPending += 1
+            if barsInPending >= bosRefreshBars
+                bosTarget := ta.lowest(close[1], bosLookback)
+                barsInPending := 0
+            if dir != -1 or not allowShort
+                tradeState := 0
+                bosTarget := na
+                barsInPending := 0
+                if dir == 1 and allowLong
+                    if enableBos
+                        tradeState := 2
+                        bosTarget := ta.highest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := 1
+            else
+                bosBreak = bosRequireClose ? (close < bosTarget) : (low < bosTarget)
+                dispOk = bosRequireDisplacement ? isDisplaced : true
+                if bosBreak and dispOk
+                    tradeState := -1
+                    barsInPending := 0
+
+        else if tradeState == 1
+            if dir != 1 or not allowLong
+                tradeState := 0
+                bosTarget := na
+                if dir == -1 and allowShort
+                    if enableBos
+                        tradeState := -2
+                        bosTarget := ta.lowest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := -1
+
+        else if tradeState == -1
+            if dir != -1 or not allowShort
+                tradeState := 0
+                bosTarget := na
+                if dir == 1 and allowLong
+                    if enableBos
+                        tradeState := 2
+                        bosTarget := ta.highest(close[1], bosLookback)
+                        barsInPending := 0
+                    else
+                        tradeState := 1
+
+// ═══════════════════════════════════════════
+// === DISPLAY STATES ===
+// ═══════════════════════════════════════════
+
+isLong = useStateMachine ? tradeState == 1 : (dir == 1 and allowLong)
+isShort = useStateMachine ? tradeState == -1 : (dir == -1 and allowShort)
+isPendingLong = useStateMachine ? tradeState == 2 : false
+isPendingShort = useStateMachine ? tradeState == -2 : false
+isPending = isPendingLong or isPendingShort
+isIdle = not isLong and not isShort and not isPending
+
+// ═══════════════════════════════════════════
+// === PLOTS ===
+// ═══════════════════════════════════════════
+
+trailStopColor = isPending ? colorPending : isIdle ? color.gray : (isLong ? color.green : color.red)
+plot(trailStop, "ATR Trailing Stop", color=trailStopColor, linewidth=2)
+plot(showHtfLine ? htfStop : na, "HTF Stop", color=color.new(color.blue, 70), linewidth=1, style=plot.style_stepline)
+
+plotshape(showShapeIcons and isLong, "Long", shape.triangleup, location.belowbar, color.green, size=size.tiny)
+plotshape(showShapeIcons and isShort, "Short", shape.triangledown, location.abovebar, color.red, size=size.tiny)
+plotshape(showShapeIcons and isPending, "Pending", shape.diamond, location.belowbar, colorPending, size=size.tiny)
+plotshape(showShapeIcons and isIdle, "Idle", shape.circle, location.belowbar, color.gray, size=size.tiny)
+
+if enableBos
+    line.delete(bosLine)
+    if showBosLine and isPending and not na(bosTarget)
+        bosLine := line.new(bar_index - 1, bosTarget, bar_index + 30, bosTarget,
+             color=colorPending, width=1, style=line.style_dashed)
+
+if showFlipLine and (flipLong or flipShort)
+    line.delete(flipLine)
+    flipLine := line.new(bar_index - 1, crossPrice, bar_index + 50, crossPrice,
+         color=flipLong ? color.green : color.red, width=2, style=line.style_dashed)
+
+// ═══════════════════════════════════════════
+// === ALERTS ===
+// ═══════════════════════════════════════════
+
+alertcondition(isLong, "ATR Long", "ATR is long")
+alertcondition(isShort, "ATR Short", "ATR is short")
+alertcondition(isIdle, "ATR Idle", "ATR is idle")
+
+// ═══════════════════════════════════════════
+// === INFO TABLE ===
+// ═══════════════════════════════════════════
+
+var table infoTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.gray, 85))
+if barstate.islast
+    row = 0
+
+    if tradeDirection != "Both"
+        table.cell(infoTable, 0, row, "Direction", text_color=color.white, text_size=size.small)
+        dirColor = tradeDirection == "Long Only" ? color.green : tradeDirection == "Short Only" ? color.red : (htfDir == 1 ? color.green : color.red)
+        dirText  = tradeDirection == "HTF Direction" ? (htfDir == 1 ? "HTF ▲ Long" : "HTF ▼ Short") : tradeDirection
+        table.cell(infoTable, 1, row, dirText, text_color=dirColor, text_size=size.small)
+        row += 1
+
+    if tradeDirection == "HTF Direction"
+        table.cell(infoTable, 0, row, "HTF (" + htfTimeframe + ")", text_color=color.white, text_size=size.small)
+        table.cell(infoTable, 1, row, htfDir == 1 ? "▲ Long" : "▼ Short", text_color=htfDir == 1 ? color.green : color.red, text_size=size.small)
+        row += 1
+
+    table.cell(infoTable, 0, row, "Entry ATR", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, row, dir == 1 ? "▲ Long" : "▼ Short", text_color=dir == 1 ? color.green : color.red, text_size=size.small)
+    row += 1
+
+    table.cell(infoTable, 0, row, "State", text_color=color.white, text_size=size.small)
+    stateText = isLong ? "▲ Long" : isShort ? "▼ Short" : isPendingLong ? "◆ Pend Long" : isPendingShort ? "◆ Pend Short" : "● Idle"
+    stateColor = isLong ? color.green : isShort ? color.red : isPending ? colorPending : color.gray
+    table.cell(infoTable, 1, row, stateText, text_color=stateColor, text_size=size.small)
+    row += 1
+
+    if enableBos
+        table.cell(infoTable, 0, row, "BOS Entry", text_color=color.white, text_size=size.small)
+        table.cell(infoTable, 1, row, isPending and not na(bosTarget) ? str.tostring(bosTarget, "#.#####") : "—", text_color=colorPending, text_size=size.small)
+        row += 1
+
+    table.cell(infoTable, 0, row, "ATR", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, row, str.tostring(atr, "#.#####"), text_color=color.white, text_size=size.small)

@@ -1,0 +1,47 @@
+//@version=5
+indicator("Trading Hours", overlay=true)
+
+// ═══════════════════════════════════════════
+// === SESSION 1 ===
+// ═══════════════════════════════════════════
+session1StartHour   = input.int(2,  "Session 1 Start Hour",   minval=0, maxval=23, group="Session 1")
+session1StartMinute = input.int(0,  "Session 1 Start Minute", minval=0, maxval=59, group="Session 1")
+session1EndHour     = input.int(5,  "Session 1 End Hour",     minval=0, maxval=23, group="Session 1")
+session1EndMinute   = input.int(0,  "Session 1 End Minute",   minval=0, maxval=59, group="Session 1")
+
+// ═══════════════════════════════════════════
+// === SESSION 2 ===
+// ═══════════════════════════════════════════
+enableSession2      = input.bool(true, "Enable Session 2",      group="Session 2")
+session2StartHour   = input.int(7,  "Session 2 Start Hour",   minval=0, maxval=23, group="Session 2")
+session2StartMinute = input.int(0,  "Session 2 Start Minute", minval=0, maxval=59, group="Session 2")
+session2EndHour     = input.int(10, "Session 2 End Hour",     minval=0, maxval=23, group="Session 2")
+session2EndMinute   = input.int(0,  "Session 2 End Minute",   minval=0, maxval=59, group="Session 2")
+
+// ═══════════════════════════════════════════
+// === TIME CHECK (minute-precision) ===
+// ═══════════════════════════════════════════
+currentMins   = hour * 60 + minute
+s1StartMins   = session1StartHour * 60 + session1StartMinute
+s1EndMins     = session1EndHour   * 60 + session1EndMinute
+s2StartMins   = session2StartHour * 60 + session2StartMinute
+s2EndMins     = session2EndHour   * 60 + session2EndMinute
+
+// Handles overnight sessions (start > end wraps midnight)
+inSession(cur, startM, endM) =>
+    startM < endM ? (cur >= startM and cur < endM) : (cur >= startM or cur < endM)
+
+inSession1       = inSession(currentMins, s1StartMins, s1EndMins)
+inSession2       = enableSession2 and inSession(currentMins, s2StartMins, s2EndMins)
+isTradingHours   = inSession1 or inSession2
+
+// ═══════════════════════════════════════════
+// === DISPLAY ===
+// ═══════════════════════════════════════════
+bgcolor(inSession1 ? color.new(color.blue, 90) : inSession2 ? color.new(color.green, 90) : na)
+
+// ═══════════════════════════════════════════
+// === ALERTS ===
+// ═══════════════════════════════════════════
+alertcondition(isTradingHours,     "Trading Hours",     "Inside trading hours")
+alertcondition(not isTradingHours, "Not Trading Hours", "Outside trading hours")
