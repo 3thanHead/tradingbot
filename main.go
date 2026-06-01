@@ -31,6 +31,20 @@ type TradingViewEvent struct {
 	TimeNow  string `json:"timenow"`
 }
 
+// OandaPricing holds real-time bid/ask pricing from OANDA
+type OandaPricing struct {
+	Bid                  float64
+	Ask                  float64
+	Mid                  float64
+	Spread               float64
+	SpreadPips           float64
+	PipValue             float64
+	Precision            int
+	Symbol               string
+	LossConversionFactor float64 // Converts quote currency P&L to home currency (for losses)
+	GainConversionFactor float64 // Converts quote currency P&L to home currency (for gains)
+}
+
 // ============================================================================
 // STRATEGY SYSTEM TYPES
 // ============================================================================
@@ -241,6 +255,16 @@ var (
 	stopLossPct       string // Stop loss in percentage (e.g., "1.5" for 1.5%)
 	stopLossDollars   string // Stop loss in dollar amount (e.g., "50" for $50 loss)
 
+	// Dynamic ATR-based SL/TP
+	dynamicSLTPEnabled bool    // DYNAMIC_SLTP=true enables ATR-based stop loss and take profit
+	riskPercent        float64 // RISK_PERCENT: % of account to risk per trade (default 2%)
+	maxMarginPercent   float64 // MAX_MARGIN_PERCENT: max % of balance usable as margin (default 50%)
+	atrMultiplierSL    float64 // ATR_MULTIPLIER_SL: SL = ATR × this (default 1.5)
+	atrMultiplierTP    float64 // ATR_MULTIPLIER_TP: TP = ATR × this (default 2.0)
+	atrPeriod          int     // ATR_PERIOD: lookback candles (default 14)
+	atrTimeframe       string  // ATR_TIMEFRAME: candle granularity (default "H1")
+	statusIntervalSec  int     // STATUS_INTERVAL: seconds between status reports while position open (default 30)
+
 	// Strategy system
 	activeStrategy          Strategy  // Currently loaded strategy
 	strategyName            string    // Name of strategy file to load
@@ -269,6 +293,12 @@ var (
 	dailyRealizedProfit      float64   // Total realized profit for today
 	dailyProfitResetTime     time.Time // When the daily profit counter was last reset
 	dailyProfitTargetReached bool      // Flag indicating daily target has been reached
+
+	// Session trade limiting
+	oneTradePerSession           bool      // ONE_TRADE_PER_SESSION: block new entries after first trade opens each session
+	oneProfitableTradePerSession bool      // ONE_PROFITABLE_TRADE_PER_SESSION: block new entries after first profitable trade closes each session
+	sessionTradeDone             bool      // True once the qualifying trade has occurred; resets each session
+	sessionTradeDoneDate         int       // YearDay of last sessionTradeDone reset (used when trading hours are disabled)
 )
 
 // Get or create position state for a symbol
@@ -1343,6 +1373,7 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 	mu.RLock()
 	enabled := strategyEnabled
 	targetReached := dailyProfitTargetReached
+	sessionDone := sessionTradeDone
 	mu.RUnlock()
 	if !enabled {
 		return false
@@ -1351,6 +1382,12 @@ func shouldOpenPosition(symbol string, isLong bool, r *http.Request) bool {
 	// Check if daily profit target has been reached
 	if dailyProfitTargetEnabled && targetReached {
 		log.Printf("🎯 [DAILY] Daily profit target reached - new positions blocked")
+		return false
+	}
+
+	// Check session trade limit
+	if (oneTradePerSession || oneProfitableTradePerSession) && sessionDone {
+		log.Printf("🚫 [SESSION] Session trade limit reached - no new entries until next session")
 		return false
 	}
 
@@ -3022,8 +3059,8 @@ func handleATRLong(w http.ResponseWriter, r *http.Request) {
 		shouldExit, reason := shouldExitPosition(symbol, false, r)
 		if shouldExit {
 			log.Printf("⚠️ [EXIT] %s → closing SHORT position", reason)
-			closePosition(symbol)
 			respondSuccess(w, "ATR long cross → SHORT closed")
+			go closePosition(symbol)
 			return
 		}
 	}
@@ -3031,8 +3068,9 @@ func handleATRLong(w http.ResponseWriter, r *http.Request) {
 	// Check if we should open LONG position
 	if !state.PositionOpen && shouldOpenPosition(symbol, true, r) {
 		log.Printf("✅ [TRADE] ATR long cross + strategy conditions met! Opening LONG position")
-		openLongPosition(symbol, event.Close)
-		respondSuccess(w, "ATR long cross → LONG opened")
+		closePrice := event.Close
+		respondSuccess(w, "ATR long cross → LONG opening")
+		go openLongPosition(symbol, closePrice)
 		return
 	}
 
@@ -3117,8 +3155,8 @@ func handleATRShort(w http.ResponseWriter, r *http.Request) {
 		shouldExit, reason := shouldExitPosition(symbol, true, r)
 		if shouldExit {
 			log.Printf("⚠️ [EXIT] %s → closing LONG position", reason)
-			closePosition(symbol)
 			respondSuccess(w, "ATR short cross → LONG closed")
+			go closePosition(symbol)
 			return
 		}
 	}
@@ -3126,8 +3164,9 @@ func handleATRShort(w http.ResponseWriter, r *http.Request) {
 	// Check if we should open SHORT position
 	if !state.PositionOpen && shouldOpenPosition(symbol, false, r) {
 		log.Printf("✅ [TRADE] ATR short cross + strategy conditions met! Opening SHORT position")
-		openShortPosition(symbol, event.Close)
-		respondSuccess(w, "ATR short cross → SHORT opened")
+		closePrice := event.Close
+		respondSuccess(w, "ATR short cross → SHORT opening")
+		go openShortPosition(symbol, closePrice)
 		return
 	}
 
@@ -3146,11 +3185,6 @@ func handleATRIdle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("🔔 [WEBHOOK] Received ATR Idle event (trend conflict)")
-
-	// Sync positions from OANDA to detect externally opened positions before deciding
-	if err := periodicSyncPositionsFromOanda(); err != nil {
-		log.Printf("⚠️  [SYNC] Failed to sync positions: %v", err)
-	}
 
 	var event TradingViewEvent
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
@@ -3226,8 +3260,8 @@ func handleATRIdle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("⚪ Closing %s position for %s", strings.ToUpper(posType), symbol)
 		log.Printf("⚪ Will stay FLAT until ATR Long or ATR Short fires")
 		log.Println(strings.Repeat("⚪", 40))
-		closePosition(symbol)
-		respondSuccess(w, fmt.Sprintf("ATR idle cross → %s closed, staying flat", strings.ToUpper(posType)))
+		respondSuccess(w, fmt.Sprintf("ATR idle cross → %s closing", strings.ToUpper(posType)))
+		go closePosition(symbol)
 		return
 	}
 
@@ -4966,6 +5000,95 @@ func handleGenericExit(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
+// ============================================================================
+// TRENDLINE WEBHOOK HANDLER
+// ============================================================================
+
+// POST /webhook/trendline/{number}
+// Dynamic route: handles any /webhook/trendline/N path
+func handleTrendline(w http.ResponseWriter, r *http.Request) {
+	webhookPath := strings.TrimRight(r.URL.Path, "/")
+
+	// Extract trendline number for logging
+	parts := strings.Split(webhookPath, "/")
+	number := "?"
+	if len(parts) >= 4 {
+		number = parts[3]
+	}
+
+	// Check if this webhook is used in the active strategy
+	if !isWebhookUsedInStrategy(webhookPath) {
+		log.Printf("⏭️  [WEBHOOK] Trendline #%s (%s) not used in current strategy - ignoring", number, webhookPath)
+		respondSuccess(w, "Webhook not used in strategy")
+		return
+	}
+
+	log.Printf("🔔 [WEBHOOK] Received Trendline #%s event", number)
+
+	// Sync positions from OANDA before deciding
+	if err := periodicSyncPositionsFromOanda(); err != nil {
+		log.Printf("⚠️  [SYNC] Failed to sync positions: %v", err)
+	}
+
+	var event TradingViewEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		log.Printf("❌ [ERROR] Invalid JSON: %v", err)
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	eventJSON, _ := json.MarshalIndent(event, "", "  ")
+	log.Printf("📥 [REQUEST] %s", string(eventJSON))
+
+	symbol := normalizeSymbol(event.Ticker)
+	if !validateSymbol(w, symbol) {
+		return
+	}
+	updateLatestPrice(symbol, event.Close)
+	state := getPositionState(symbol)
+
+	log.Printf("📊 Trendline #%s hit for %s", number, symbol)
+
+	// Check if we should exit an open position
+	if state.PositionOpen {
+		if state.Position == "long" {
+			shouldExit, reason := shouldExitPosition(symbol, true, r)
+			if shouldExit {
+				log.Printf("⚠️  [EXIT] %s → closing LONG position (trendline #%s)", reason, number)
+				closePosition(symbol)
+				respondSuccess(w, fmt.Sprintf("Trendline #%s hit → LONG closed", number))
+				return
+			}
+		} else if state.Position == "short" {
+			shouldExit, reason := shouldExitPosition(symbol, false, r)
+			if shouldExit {
+				log.Printf("⚠️  [EXIT] %s → closing SHORT position (trendline #%s)", reason, number)
+				closePosition(symbol)
+				respondSuccess(w, fmt.Sprintf("Trendline #%s hit → SHORT closed", number))
+				return
+			}
+		}
+		respondSuccess(w, fmt.Sprintf("Trendline #%s hit - exit conditions not met", number))
+		return
+	}
+
+	// No open position - check if we should enter one
+	if shouldOpenPosition(symbol, true, r) {
+		log.Printf("✅ [TRADE] Trendline #%s → opening LONG position", number)
+		openLongPosition(symbol, event.Close)
+		respondSuccess(w, fmt.Sprintf("Trendline #%s hit → LONG opened", number))
+		return
+	}
+	if shouldOpenPosition(symbol, false, r) {
+		log.Printf("✅ [TRADE] Trendline #%s → opening SHORT position", number)
+		openShortPosition(symbol, event.Close)
+		respondSuccess(w, fmt.Sprintf("Trendline #%s hit → SHORT opened", number))
+		return
+	}
+
+	respondSuccess(w, fmt.Sprintf("Trendline #%s hit - no action taken", number))
+}
+
 // MACD HISTOGRAM ZERO-LINE CROSS HANDLERS
 // ============================================================================
 
@@ -6109,6 +6232,115 @@ func getCurrentPrice(symbol string) (float64, error) {
 	return price, nil
 }
 
+// getOandaPricing fetches real-time bid, ask, and spread from OANDA pricing API
+// Returns complete pricing data including pip value and precision from instrument info
+func getOandaPricing(symbol string) (*OandaPricing, error) {
+	url := fmt.Sprintf("%s/v3/accounts/%s/pricing?instruments=%s", oandaBaseURL, oandaAccountID, symbol)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("OANDA pricing request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode pricing response: %v", err)
+	}
+
+	prices, ok := result["prices"].([]interface{})
+	if !ok || len(prices) == 0 {
+		return nil, fmt.Errorf("no pricing data for %s", symbol)
+	}
+
+	priceData, ok := prices[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid price data format")
+	}
+
+	// Parse asks
+	asks, ok := priceData["asks"].([]interface{})
+	if !ok || len(asks) == 0 {
+		return nil, fmt.Errorf("no ask prices for %s", symbol)
+	}
+	askData, _ := asks[0].(map[string]interface{})
+	askStr, _ := askData["price"].(string)
+	ask := 0.0
+	fmt.Sscanf(askStr, "%f", &ask)
+
+	// Parse bids
+	bids, ok := priceData["bids"].([]interface{})
+	if !ok || len(bids) == 0 {
+		return nil, fmt.Errorf("no bid prices for %s", symbol)
+	}
+	bidData, _ := bids[0].(map[string]interface{})
+	bidStr, _ := bidData["price"].(string)
+	bid := 0.0
+	fmt.Sscanf(bidStr, "%f", &bid)
+
+	// Get pip value and precision from OANDA instrument info
+	_, pipLocation, err := getInstrumentInfo(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get instrument info for %s: %v", symbol, err)
+	}
+	pipValue := math.Pow(10, float64(pipLocation))
+	precision := -pipLocation
+	if precision < 1 {
+		precision = 5
+	}
+
+	spread := ask - bid
+	mid := (ask + bid) / 2.0
+	spreadPips := spread / pipValue
+
+	log.Printf("\U0001F4CA [OANDA PRICING] %s — Bid: %.*f | Ask: %.*f | Spread: %.*f (%.1f pips) | Pip: %.*f",
+		symbol, precision, bid, precision, ask, precision, spread, spreadPips, precision, pipValue)
+
+	// Extract home conversion factors (converts quote currency P&L to account currency)
+	lossConvFactor := 0.0
+	gainConvFactor := 0.0
+	if homeConversion, ok := priceData["homeConversionFactors"].(map[string]interface{}); ok {
+		if factorObj, ok := homeConversion["lossQuoteHome"].(map[string]interface{}); ok {
+			if factorStr, ok := factorObj["factor"].(string); ok {
+				fmt.Sscanf(factorStr, "%f", &lossConvFactor)
+			}
+		}
+		if factorObj, ok := homeConversion["gainQuoteHome"].(map[string]interface{}); ok {
+			if factorStr, ok := factorObj["factor"].(string); ok {
+				fmt.Sscanf(factorStr, "%f", &gainConvFactor)
+			}
+		}
+	}
+	// Default to 1.0 for USD-quoted pairs
+	if lossConvFactor == 0 {
+		if strings.HasSuffix(symbol, "_USD") {
+			lossConvFactor = 1.0
+		}
+	}
+	if gainConvFactor == 0 {
+		if strings.HasSuffix(symbol, "_USD") {
+			gainConvFactor = 1.0
+		}
+	}
+
+	return &OandaPricing{
+		Bid:                  bid,
+		Ask:                  ask,
+		Mid:                  mid,
+		Spread:               spread,
+		SpreadPips:           spreadPips,
+		PipValue:             pipValue,
+		Precision:            precision,
+		Symbol:               symbol,
+		LossConversionFactor: lossConvFactor,
+		GainConversionFactor: gainConvFactor,
+	}, nil
+}
+
 // Get unrealized P/L for an open trade from OANDA
 // Returns the unrealized P/L in account currency (typically USD)
 func getOandaTradeUnrealizedPL(tradeID string) (float64, error) {
@@ -6152,6 +6384,86 @@ func getOandaTradeUnrealizedPL(tradeID string) (float64, error) {
 	unrealizedPL := 0.0
 	fmt.Sscanf(unrealizedPLStr, "%f", &unrealizedPL)
 	return unrealizedPL, nil
+}
+
+// OandaTradeDetails holds live trade data from OANDA
+type OandaTradeDetails struct {
+	TradeID         string
+	Instrument      string
+	Price           float64 // entry price
+	CurrentUnits    int
+	UnrealizedPL    float64
+	MarginUsed      float64
+	OpenTime        string
+	StopLossPrice   float64
+	TakeProfitPrice float64
+}
+
+// getOandaTradeDetails fetches full trade info from OANDA
+func getOandaTradeDetails(tradeID string) (*OandaTradeDetails, error) {
+	if tradeID == "" {
+		return nil, fmt.Errorf("no trade ID provided")
+	}
+
+	url := fmt.Sprintf("%s/v3/accounts/%s/trades/%s", oandaBaseURL, oandaAccountID, tradeID)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch trade: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("OANDA API returned status %d", resp.StatusCode)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	trade, ok := result["trade"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid trade data")
+	}
+
+	details := &OandaTradeDetails{}
+	details.TradeID = tradeID
+
+	if v, ok := trade["instrument"].(string); ok {
+		details.Instrument = v
+	}
+	if v, ok := trade["price"].(string); ok {
+		fmt.Sscanf(v, "%f", &details.Price)
+	}
+	if v, ok := trade["currentUnits"].(string); ok {
+		fmt.Sscanf(v, "%d", &details.CurrentUnits)
+	}
+	if v, ok := trade["unrealizedPL"].(string); ok {
+		fmt.Sscanf(v, "%f", &details.UnrealizedPL)
+	}
+	if v, ok := trade["marginUsed"].(string); ok {
+		fmt.Sscanf(v, "%f", &details.MarginUsed)
+	}
+	if v, ok := trade["openTime"].(string); ok {
+		details.OpenTime = v
+	}
+	if slOrder, ok := trade["stopLossOrder"].(map[string]interface{}); ok {
+		if v, ok := slOrder["price"].(string); ok {
+			fmt.Sscanf(v, "%f", &details.StopLossPrice)
+		}
+	}
+	if tpOrder, ok := trade["takeProfitOrder"].(map[string]interface{}); ok {
+		if v, ok := tpOrder["price"].(string); ok {
+			fmt.Sscanf(v, "%f", &details.TakeProfitPrice)
+		}
+	}
+
+	return details, nil
 }
 
 // Get realized P/L from a closed trade (used when position is closed)
@@ -6355,6 +6667,49 @@ func addDailyRealizedProfit(profit float64) {
 	checkDailyProfitTarget()
 }
 
+// markSessionTradeDone sets the session trade done flag, blocking further entries this session.
+// Called after a trade opens (oneTradePerSession) or a profitable trade closes (oneProfitableTradePerSession).
+func markSessionTradeDone() {
+	mu.Lock()
+	sessionTradeDone = true
+	sessionTradeDoneDate = getLocalTime().YearDay()
+	mu.Unlock()
+	log.Printf("🔒 [SESSION] Session trade limit reached - no more entries until next session opens")
+}
+
+// resetSessionTradeDone clears the session trade done flag (called when a new session opens).
+func resetSessionTradeDone() {
+	mu.Lock()
+	sessionTradeDone = false
+	sessionTradeDoneDate = getLocalTime().YearDay()
+	mu.Unlock()
+	log.Printf("🔄 [SESSION] Session trade limit reset - ready for a new trade this session")
+}
+
+// checkSessionTradeDailyReset resets the session trade done flag at the start of a new calendar day.
+// Only used when trading hours are not configured (the whole day is treated as one session).
+func checkSessionTradeDailyReset() {
+	if !oneTradePerSession && !oneProfitableTradePerSession {
+		return
+	}
+	if tradingHoursEnabled {
+		// When trading hours are enabled, reset is handled by checkTradingHoursTransition
+		return
+	}
+	mu.RLock()
+	done := sessionTradeDone
+	doneDate := sessionTradeDoneDate
+	mu.RUnlock()
+	if !done {
+		return
+	}
+	now := getLocalTime()
+	if now.YearDay() != doneDate {
+		resetSessionTradeDone()
+		log.Printf("🔄 [SESSION] New calendar day - session trade limit reset")
+	}
+}
+
 // Calculate units from USD amount
 func calculateUnitsFromUSD(symbol string, usdAmount float64) (string, error) {
 	log.Printf("💱 [CALCULATE] Converting $%.2f USD to units for %s", usdAmount, symbol)
@@ -6392,6 +6747,212 @@ func getPipValue(symbol string) (float64, error) {
 	return pipValue, nil
 }
 
+// getAccountBalance fetches the current account balance from OANDA
+func getAccountBalance() (float64, error) {
+	url := fmt.Sprintf("%s/v3/accounts/%s/summary", oandaBaseURL, oandaAccountID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch account summary: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to decode account summary: %v", err)
+	}
+
+	account, ok := result["account"].(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("account field not found in response")
+	}
+
+	balanceStr, ok := account["balance"].(string)
+	if !ok {
+		return 0, fmt.Errorf("balance field not found in account")
+	}
+
+	balance := 0.0
+	fmt.Sscanf(balanceStr, "%f", &balance)
+	return balance, nil
+}
+
+// getATRFromOanda calculates ATR using OANDA candle data
+// Returns ATR in price units (not pips)
+func getATRFromOanda(symbol string, period int, granularity string) (float64, error) {
+	count := period + 1
+	url := fmt.Sprintf("%s/v3/instruments/%s/candles?granularity=%s&count=%d&price=M",
+		oandaBaseURL, symbol, granularity, count)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+oandaAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch candles: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("failed to decode candles: %v", err)
+	}
+
+	candlesRaw, ok := result["candles"].([]interface{})
+	if !ok || len(candlesRaw) < period+1 {
+		return 0, fmt.Errorf("insufficient candle data: got %d, need %d", len(candlesRaw), period+1)
+	}
+
+	type candle struct {
+		High, Low, Close float64
+	}
+	candles := make([]candle, len(candlesRaw))
+
+	for i, c := range candlesRaw {
+		cMap := c.(map[string]interface{})
+		mid := cMap["mid"].(map[string]interface{})
+		h, l, cl := 0.0, 0.0, 0.0
+		fmt.Sscanf(mid["h"].(string), "%f", &h)
+		fmt.Sscanf(mid["l"].(string), "%f", &l)
+		fmt.Sscanf(mid["c"].(string), "%f", &cl)
+		candles[i] = candle{High: h, Low: l, Close: cl}
+	}
+
+	trSum := 0.0
+	for i := 1; i < len(candles); i++ {
+		prevClose := candles[i-1].Close
+		tr1 := candles[i].High - candles[i].Low
+		tr2 := math.Abs(candles[i].High - prevClose)
+		tr3 := math.Abs(candles[i].Low - prevClose)
+		tr := math.Max(tr1, math.Max(tr2, tr3))
+		trSum += tr
+	}
+
+	atr := trSum / float64(period)
+	return atr, nil
+}
+
+// DynamicRiskResult holds ATR-based SL/TP and risk-sized position
+type DynamicRiskResult struct {
+	SLPips  float64
+	TPPips  float64
+	Units   int
+	Balance float64
+}
+
+// calculateDynamicSLTP computes SL/TP pip distances from ATR and position size from account balance
+func calculateDynamicSLTP(symbol string, entryPrice float64) (*DynamicRiskResult, error) {
+	atr, err := getATRFromOanda(symbol, atrPeriod, atrTimeframe)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ATR: %v", err)
+	}
+
+	pipValue, err := getPipValue(symbol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pip value: %v", err)
+	}
+
+	atrInPips := atr / pipValue
+	slPips := atrInPips * atrMultiplierSL
+	tpPips := atrInPips * atrMultiplierTP
+
+	// Get account balance and calculate risk-based position size
+	balance, err := getAccountBalance()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get account balance: %v", err)
+	}
+
+	riskAmount := balance * (riskPercent / 100.0)
+
+	// Get leverage for margin calculations
+	leverage := 50.0
+	if entryPrice > 0 {
+		lev, _, levErr := getInstrumentInfo(symbol)
+		if levErr == nil {
+			leverage = lev
+		}
+	}
+
+	// Calculate the minimum SL pips needed to avoid hitting the margin cap.
+	// Math: units = riskAmount / (slPips × pipValue)
+	//       margin = units × entryPrice / leverage
+	//       margin ≤ maxMarginPercent% × balance
+	// Solving: slPips ≥ riskAmount × entryPrice / (leverage × pipValue × maxMarginPercent/100 × balance)
+	pipsWidened := false
+	originalSLPips := slPips
+	originalTPPips := tpPips
+	if entryPrice > 0 {
+		maxMargin := balance * (maxMarginPercent / 100.0)
+		marginPerUnit := entryPrice / leverage
+		minSLPips := riskAmount / (maxMargin / marginPerUnit * pipValue)
+		if slPips < minSLPips {
+			// ATR-based SL is too tight for this account — position would exceed margin cap.
+			// Widen SL to fit, and scale TP proportionally to preserve R:R ratio.
+			scaleFactor := minSLPips / slPips
+			slPips = minSLPips
+			tpPips = tpPips * scaleFactor
+			pipsWidened = true
+		}
+	}
+
+	// Units = riskAmount / (slPips × pipValue)
+	// This sizes the position so that a full SL hit = exactly riskAmount dollars
+	units := int(riskAmount / (slPips * pipValue))
+	if units < 1 {
+		units = 1
+	}
+
+	// Double-check margin usage (should be within cap since we pre-adjusted pips)
+	actualMargin := 0.0
+	if entryPrice > 0 {
+		marginPerUnit := entryPrice / leverage
+		actualMargin = float64(units) * marginPerUnit
+		maxMargin := balance * (maxMarginPercent / 100.0)
+		// Safety net: if still over (rounding), clamp units
+		if actualMargin > maxMargin {
+			units = int(maxMargin / marginPerUnit)
+			if units < 1 {
+				units = 1
+			}
+			actualMargin = float64(units) * marginPerUnit
+		}
+	}
+
+	actualRisk := float64(units) * slPips * pipValue
+	marginPct := 0.0
+	if balance > 0 {
+		marginPct = (actualMargin / balance) * 100.0
+	}
+
+	log.Printf("📊 [DYNAMIC RISK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("📊 [DYNAMIC RISK] Account balance: $%.2f", balance)
+	log.Printf("📊 [DYNAMIC RISK] Risk per trade: %.1f%% = $%.2f", riskPercent, riskAmount)
+	log.Printf("📊 [DYNAMIC RISK] ATR(%d, %s): %.5f (%.1f pips)", atrPeriod, atrTimeframe, atr, atrInPips)
+	if pipsWidened {
+		log.Printf("📊 [DYNAMIC RISK] ⚠️  Pips widened by account size (ATR SL: %.1f → %.1f pips, TP: %.1f → %.1f pips)",
+			originalSLPips, slPips, originalTPPips, tpPips)
+		log.Printf("📊 [DYNAMIC RISK]    Reason: ATR-based SL too tight → position would exceed %.0f%% margin cap", maxMarginPercent)
+	}
+	log.Printf("📊 [DYNAMIC RISK] SL: %.1f pips | TP: %.1f pips (R:R = 1:%.1f)", slPips, tpPips, tpPips/slPips)
+	log.Printf("📊 [DYNAMIC RISK] Position: %d units | Margin: $%.2f (%.1f%% of balance) | SL hit = $%.2f loss",
+		units, actualMargin, marginPct, actualRisk)
+	log.Printf("📊 [DYNAMIC RISK] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	return &DynamicRiskResult{
+		SLPips:  slPips,
+		TPPips:  tpPips,
+		Units:   units,
+		Balance: balance,
+	}, nil
+}
+
 // getStopLossDistance returns the price distance for pip-based stop loss
 // Returns (distance, precision, error) - distance is used with OANDA's "distance" parameter
 func getStopLossDistance(symbol string) (string, int, error) {
@@ -6409,9 +6970,9 @@ func getStopLossDistance(symbol string) (string, int, error) {
 
 	distance := pips * pipValue
 
-	// Determine precision based on pip location
+	// Determine precision based on pip location (+1 for fractional pips like 5.5)
 	_, pipLocation, _ := getInstrumentInfo(symbol)
-	precision := -pipLocation // e.g., pipLocation=-4 means precision=4 (0.0001)
+	precision := -pipLocation + 1 // e.g., pipLocation=-4 means precision=5 (0.00055)
 	if precision < 1 {
 		precision = 5 // fallback
 	}
@@ -6438,9 +6999,9 @@ func getTakeProfitDistance(symbol string) (string, int, error) {
 
 	distance := pips * pipValue
 
-	// Determine precision based on pip location
+	// Determine precision based on pip location (+1 for fractional pips like 5.5)
 	_, pipLocation, _ := getInstrumentInfo(symbol)
-	precision := -pipLocation
+	precision := -pipLocation + 1 // e.g., pipLocation=-4 means precision=5 (0.00055)
 	if precision < 1 {
 		precision = 5
 	}
@@ -6532,25 +7093,49 @@ func calculatePriceMoveForDollars(symbol string, currentPrice float64, targetDol
 	return priceMove, nil
 }
 
-// Calculate take profit price based on pips or percentage
-func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, units int) (string, error) {
+// calculateTakeProfitPrice calculates exact take profit price from OANDA pricing data
+// Uses real-time bid/ask prices to account for spread and OANDA's pipLocation for precision
+func calculateTakeProfitPrice(pricing *OandaPricing, isLong bool, units int) (string, error) {
 	if takeProfitPips == "" && takeProfitPct == "" && takeProfitDollars == "" {
-		return "", nil // No take profit set
+		return "", nil
+	}
+
+	// Entry price: ask for LONG (buying), bid for SHORT (selling)
+	entryPrice := pricing.Ask
+	if !isLong {
+		entryPrice = pricing.Bid
 	}
 
 	var tpPrice float64
 
-	if takeProfitDollars != "" {
-		// Calculate based on dollar profit target using OANDA's home conversion
+	if takeProfitPips != "" {
+		pips := 0.0
+		fmt.Sscanf(takeProfitPips, "%f", &pips)
+
+		pipDistance := pips * pricing.PipValue
+
+		if isLong {
+			tpPrice = entryPrice + pipDistance
+		} else {
+			tpPrice = entryPrice - pipDistance
+		}
+
+		// Calculate dollar equivalent: pips × pipValue × units
+		dollarEquiv := pipDistance * float64(units)
+		log.Printf("🎯 [TP CALC] %.1f pips × %.*f pip value = %.*f distance (≈ $%.2f with %d units)",
+			pips, pricing.Precision, pricing.PipValue, pricing.Precision, pipDistance, dollarEquiv, units)
+		log.Printf("🎯 [TP CALC] Entry (%s): %.*f → TP: %.*f (%s) | Spread: %.1f pips",
+			map[bool]string{true: "Ask", false: "Bid"}[isLong],
+			pricing.Precision, entryPrice, pricing.Precision, tpPrice,
+			map[bool]string{true: "LONG", false: "SHORT"}[isLong], pricing.SpreadPips)
+
+	} else if takeProfitDollars != "" {
 		dollars := 0.0
 		fmt.Sscanf(takeProfitDollars, "%f", &dollars)
 
-		// Query OANDA for accurate conversion factor
-		// Take profit is always a gain, so use isGain=true to get gainQuoteHome factor
-		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, true)
+		priceMove, err := calculatePriceMoveForDollars(pricing.Symbol, entryPrice, dollars, units, true)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get accurate conversion, using simple calculation: %v", err)
-			// Fallback to simple calculation (works for XXX_USD pairs)
 			priceMove = dollars / float64(units)
 		}
 
@@ -6560,35 +7145,16 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, un
 			tpPrice = entryPrice - priceMove
 		}
 
-		log.Printf("🎯 [TP CALC] $%.2f profit target with %d units = %.5f price move", dollars, units, priceMove)
-		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
-
-	} else if takeProfitPips != "" {
-		// Calculate based on pips
-		pips := 0.0
-		fmt.Sscanf(takeProfitPips, "%f", &pips)
-
-		// Determine pip value based on instrument
-		// For JPY pairs (e.g., USD_JPY), 1 pip = 0.01
-		// For most other pairs, 1 pip = 0.0001
-		pipValue := 0.0001
-		if strings.Contains(symbol, "JPY") {
-			pipValue = 0.01
-		}
-
-		pipDistance := pips * pipValue
-
-		if isLong {
-			tpPrice = entryPrice + pipDistance
-		} else {
-			tpPrice = entryPrice - pipDistance
-		}
-
-		log.Printf("🎯 [TP CALC] %.0f pips = %.5f price distance", pips, pipDistance)
-		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+		// Calculate pip equivalent
+		pipEquiv := priceMove / pricing.PipValue
+		log.Printf("🎯 [TP CALC] $%.2f target with %d units = %.*f price move (≈ %.1f pips)",
+			dollars, units, pricing.Precision, priceMove, pipEquiv)
+		log.Printf("🎯 [TP CALC] Entry (%s): %.*f → TP: %.*f (%s) | Spread: %.1f pips",
+			map[bool]string{true: "Ask", false: "Bid"}[isLong],
+			pricing.Precision, entryPrice, pricing.Precision, tpPrice,
+			map[bool]string{true: "LONG", false: "SHORT"}[isLong], pricing.SpreadPips)
 
 	} else if takeProfitPct != "" {
-		// Calculate based on percentage
 		pct := 0.0
 		fmt.Sscanf(takeProfitPct, "%f", &pct)
 
@@ -6600,37 +7166,60 @@ func calculateTakeProfitPrice(symbol string, entryPrice float64, isLong bool, un
 			tpPrice = entryPrice - priceMove
 		}
 
-		log.Printf("🎯 [TP CALC] %.2f%% = %.5f price distance", pct, priceMove)
-		log.Printf("🎯 [TP CALC] Entry: %.5f → TP: %.5f (%s)", entryPrice, tpPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+		log.Printf("🎯 [TP CALC] %.2f%% = %.*f price distance",
+			pct, pricing.Precision, priceMove)
+		log.Printf("🎯 [TP CALC] Entry (%s): %.*f → TP: %.*f (%s) | Spread: %.1f pips",
+			map[bool]string{true: "Ask", false: "Bid"}[isLong],
+			pricing.Precision, entryPrice, pricing.Precision, tpPrice,
+			map[bool]string{true: "LONG", false: "SHORT"}[isLong], pricing.SpreadPips)
 	}
 
-	// Format price with appropriate precision
-	precision := 5
-	if strings.Contains(symbol, "JPY") {
-		precision = 3
-	}
-
-	return fmt.Sprintf("%.*f", precision, tpPrice), nil
+	return fmt.Sprintf("%.*f", pricing.Precision, tpPrice), nil
 }
 
-func calculateStopLossPrice(symbol string, entryPrice float64, isLong bool, units int) (string, error) {
+// calculateStopLossPrice calculates exact stop loss price from OANDA pricing data
+// Uses real-time bid/ask prices to account for spread and OANDA's pipLocation for precision
+func calculateStopLossPrice(pricing *OandaPricing, isLong bool, units int) (string, error) {
 	if stopLossPips == "" && stopLossPct == "" && stopLossDollars == "" {
-		return "", nil // No stop loss set
+		return "", nil
+	}
+
+	// Entry price: ask for LONG (buying), bid for SHORT (selling)
+	entryPrice := pricing.Ask
+	if !isLong {
+		entryPrice = pricing.Bid
 	}
 
 	var slPrice float64
 
-	if stopLossDollars != "" {
-		// Calculate based on dollar loss limit using OANDA's home conversion
+	if stopLossPips != "" {
+		pips := 0.0
+		fmt.Sscanf(stopLossPips, "%f", &pips)
+
+		pipDistance := pips * pricing.PipValue
+
+		if isLong {
+			slPrice = entryPrice - pipDistance
+		} else {
+			slPrice = entryPrice + pipDistance
+		}
+
+		// Calculate dollar equivalent: pips × pipValue × units
+		dollarEquiv := pipDistance * float64(units)
+		log.Printf("🛑 [SL CALC] %.1f pips × %.*f pip value = %.*f distance (≈ $%.2f with %d units)",
+			pips, pricing.Precision, pricing.PipValue, pricing.Precision, pipDistance, dollarEquiv, units)
+		log.Printf("🛑 [SL CALC] Entry (%s): %.*f → SL: %.*f (%s) | Spread: %.1f pips",
+			map[bool]string{true: "Ask", false: "Bid"}[isLong],
+			pricing.Precision, entryPrice, pricing.Precision, slPrice,
+			map[bool]string{true: "LONG", false: "SHORT"}[isLong], pricing.SpreadPips)
+
+	} else if stopLossDollars != "" {
 		dollars := 0.0
 		fmt.Sscanf(stopLossDollars, "%f", &dollars)
 
-		// Query OANDA for accurate conversion factor
-		// Stop loss is always a loss, so use isGain=false to get lossQuoteHome factor
-		priceMove, err := calculatePriceMoveForDollars(symbol, entryPrice, dollars, units, false)
+		priceMove, err := calculatePriceMoveForDollars(pricing.Symbol, entryPrice, dollars, units, false)
 		if err != nil {
 			log.Printf("⚠️  [WARNING] Failed to get accurate conversion, using simple calculation: %v", err)
-			// Fallback to simple calculation (works for XXX_USD pairs)
 			priceMove = dollars / float64(units)
 		}
 
@@ -6640,33 +7229,16 @@ func calculateStopLossPrice(symbol string, entryPrice float64, isLong bool, unit
 			slPrice = entryPrice + priceMove
 		}
 
-		log.Printf("🛑 [SL CALC] $%.2f loss limit with %d units = %.5f price move", dollars, units, priceMove)
-		log.Printf("🛑 [SL CALC] Entry: %.5f → SL: %.5f (%s)", entryPrice, slPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
-
-	} else if stopLossPips != "" {
-		// Calculate based on pips
-		pips := 0.0
-		fmt.Sscanf(stopLossPips, "%f", &pips)
-
-		// Determine pip value based on instrument
-		pipValue := 0.0001
-		if strings.Contains(symbol, "JPY") {
-			pipValue = 0.01
-		}
-
-		pipDistance := pips * pipValue
-
-		if isLong {
-			slPrice = entryPrice - pipDistance
-		} else {
-			slPrice = entryPrice + pipDistance
-		}
-
-		log.Printf("🛑 [SL CALC] %.0f pips = %.5f price distance", pips, pipDistance)
-		log.Printf("🛑 [SL CALC] Entry: %.5f → SL: %.5f (%s)", entryPrice, slPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+		// Calculate pip equivalent
+		pipEquiv := priceMove / pricing.PipValue
+		log.Printf("🛑 [SL CALC] $%.2f limit with %d units = %.*f price move (≈ %.1f pips)",
+			dollars, units, pricing.Precision, priceMove, pipEquiv)
+		log.Printf("🛑 [SL CALC] Entry (%s): %.*f → SL: %.*f (%s) | Spread: %.1f pips",
+			map[bool]string{true: "Ask", false: "Bid"}[isLong],
+			pricing.Precision, entryPrice, pricing.Precision, slPrice,
+			map[bool]string{true: "LONG", false: "SHORT"}[isLong], pricing.SpreadPips)
 
 	} else if stopLossPct != "" {
-		// Calculate based on percentage
 		pct := 0.0
 		fmt.Sscanf(stopLossPct, "%f", &pct)
 
@@ -6678,20 +7250,19 @@ func calculateStopLossPrice(symbol string, entryPrice float64, isLong bool, unit
 			slPrice = entryPrice + priceMove
 		}
 
-		log.Printf("🛑 [SL CALC] %.2f%% = %.5f price distance", pct, priceMove)
-		log.Printf("🛑 [SL CALC] Entry: %.5f → SL: %.5f (%s)", entryPrice, slPrice, map[bool]string{true: "LONG", false: "SHORT"}[isLong])
+		log.Printf("🛑 [SL CALC] %.2f%% = %.*f price distance",
+			pct, pricing.Precision, priceMove)
+		log.Printf("🛑 [SL CALC] Entry (%s): %.*f → SL: %.*f (%s) | Spread: %.1f pips",
+			map[bool]string{true: "Ask", false: "Bid"}[isLong],
+			pricing.Precision, entryPrice, pricing.Precision, slPrice,
+			map[bool]string{true: "LONG", false: "SHORT"}[isLong], pricing.SpreadPips)
 	}
 
-	// Format price with appropriate precision
-	precision := 5
-	if strings.Contains(symbol, "JPY") {
-		precision = 3
-	}
-
-	return fmt.Sprintf("%.*f", precision, slPrice), nil
+	return fmt.Sprintf("%.*f", pricing.Precision, slPrice), nil
 }
 
 // Get trade specification for OANDA order (units or margin-based)
+// Fetches real-time OANDA pricing to calculate exact SL/TP price levels
 func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 	orderSpec := map[string]interface{}{
 		"instrument":   symbol,
@@ -6700,26 +7271,44 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 		"positionFill": "DEFAULT",
 	}
 
+	// Fetch real-time OANDA pricing (bid/ask/spread/pip info) — single API call
+	pricing, pricingErr := getOandaPricing(symbol)
+	if pricingErr != nil {
+		log.Printf("⚠️  [WARNING] Failed to get OANDA pricing: %v", pricingErr)
+	}
+
+	// Use correct entry price: ask for LONG (buying), bid for SHORT (selling)
+	var entryPrice float64
+	if pricing != nil {
+		entryPrice = pricing.Ask
+		if !isLong {
+			entryPrice = pricing.Bid
+		}
+	}
+
+	var units int
+
 	// Priority: MARGIN_AMOUNT > TRADE_USD_AMOUNT > TRADE_UNITS
-	if tradeMargin != "" {
-		// For margin-based trading, we need to calculate the USD position size
-		// then convert to units based on the instrument
+	if orderSpec["units"] == nil && tradeMargin != "" {
 		marginAmount := 0.0
 		fmt.Sscanf(tradeMargin, "%f", &marginAmount)
 
 		if marginAmount > 0 {
 			log.Printf("💰 [MARGIN] Using margin amount: $%.2f", marginAmount)
 
-			// Get current price
-			price, err := getCurrentPrice(symbol)
-			if err != nil {
-				log.Printf("❌ [ERROR] Failed to get price for margin calculation: %v", err)
-				log.Printf("⚠️  [FALLBACK] Using default units: %s", tradeUnits)
-				orderSpec["units"] = tradeUnits
-				if !isLong {
-					orderSpec["units"] = "-" + tradeUnits
+			// Get entry price for sizing (fallback to getCurrentPrice if pricing failed)
+			if entryPrice == 0 {
+				price, err := getCurrentPrice(symbol)
+				if err != nil {
+					log.Printf("❌ [ERROR] Failed to get price for margin calculation: %v", err)
+					log.Printf("⚠️  [FALLBACK] Using default units: %s", tradeUnits)
+					orderSpec["units"] = tradeUnits
+					if !isLong {
+						orderSpec["units"] = "-" + tradeUnits
+					}
+					return orderSpec
 				}
-				return orderSpec
+				entryPrice = price
 			}
 
 			// Get instrument-specific leverage from OANDA
@@ -6730,85 +7319,22 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 				leverage = 50.0
 			}
 
-			// Calculate units based on margin and leverage
-			// Formula: margin_per_unit = price / leverage
-			//          units = margin_amount / margin_per_unit
-			marginPerUnit := price / leverage
-			units := int(marginAmount / marginPerUnit)
+			marginPerUnit := entryPrice / leverage
+			units = int(marginAmount / marginPerUnit)
 
-			log.Printf("💱 [MARGIN CALC] Price: %.5f, Leverage: %.0f:1", price, leverage)
-			log.Printf("� [MARGIN CALC] Margin per unit: $%.6f", marginPerUnit)
+			log.Printf("💱 [MARGIN CALC] Price: %.5f (%s), Leverage: %.0f:1",
+				entryPrice, map[bool]string{true: "Ask", false: "Bid"}[isLong], leverage)
+			log.Printf("💱 [MARGIN CALC] Margin per unit: $%.6f", marginPerUnit)
 			log.Printf("💱 [MARGIN CALC] Margin: $%.2f ÷ $%.6f = %d units", marginAmount, marginPerUnit, units)
-			log.Printf("💱 [POSITION SIZE] %d units × $%.5f = $%.2f position", units, price, float64(units)*price)
+			log.Printf("💱 [POSITION SIZE] %d units × $%.5f = $%.2f position", units, entryPrice, float64(units)*entryPrice)
 
 			unitsStr := fmt.Sprintf("%d", units)
 			if !isLong {
 				unitsStr = "-" + unitsStr
 			}
 			orderSpec["units"] = unitsStr
-
-			// Add take profit if configured
-			if takeProfitPips != "" {
-				// Use distance parameter for pip-based take profit (more accurate)
-				tpDistance, _, err := getTakeProfitDistance(symbol)
-				if err != nil {
-					log.Printf("⚠️  [WARNING] Failed to get take profit distance: %v", err)
-				} else if tpDistance != "" {
-					orderSpec["takeProfitOnFill"] = map[string]interface{}{
-						"distance":    tpDistance,
-						"timeInForce": "GTC",
-					}
-					log.Printf("🎯 [TP] Take profit distance set at %s", tpDistance)
-				}
-			} else if takeProfitPct != "" || takeProfitDollars != "" {
-				// Use price for percentage/dollar-based take profit
-				tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, units)
-				if err != nil {
-					log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
-				} else if tpPrice != "" {
-					orderSpec["takeProfitOnFill"] = map[string]interface{}{
-						"price":       tpPrice,
-						"timeInForce": "GTC",
-					}
-					log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
-				}
-			}
-
-			// Add stop loss if configured
-			if stopLossPips != "" {
-				// Use distance parameter for pip-based stop loss (more accurate)
-				slDistance, _, err := getStopLossDistance(symbol)
-				if err != nil {
-					log.Printf("⚠️  [WARNING] Failed to get stop loss distance: %v", err)
-				} else if slDistance != "" {
-					orderSpec["stopLossOnFill"] = map[string]interface{}{
-						"distance":    slDistance,
-						"timeInForce": "GTC",
-					}
-					log.Printf("🛑 [SL] Stop loss distance set at %s", slDistance)
-				}
-			} else if stopLossPct != "" || stopLossDollars != "" {
-				// Use price for percentage/dollar-based stop loss
-				slPrice, err := calculateStopLossPrice(symbol, price, isLong, units)
-				if err != nil {
-					log.Printf("⚠️  [WARNING] Failed to calculate stop loss: %v", err)
-				} else if slPrice != "" {
-					orderSpec["stopLossOnFill"] = map[string]interface{}{
-						"price":       slPrice,
-						"timeInForce": "GTC",
-					}
-					log.Printf("🛑 [SL] Stop loss set at %s", slPrice)
-				}
-			}
-
-			return orderSpec
 		}
-	}
-
-	// Fallback to units-based ordering
-	var units string
-	if tradeUSDAmount != "" {
-		// Calculate units from USD amount
+	} else if orderSpec["units"] == nil && tradeUSDAmount != "" {
 		usdAmount := 0.0
 		fmt.Sscanf(tradeUSDAmount, "%f", &usdAmount)
 
@@ -6816,95 +7342,137 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 			calculatedUnits, err := calculateUnitsFromUSD(symbol, usdAmount)
 			if err != nil {
 				log.Printf("⚠️  [WARNING] Failed to calculate units from USD, using default: %s", tradeUnits)
-				units = tradeUnits
-			} else {
-				units = calculatedUnits
+				calculatedUnits = tradeUnits
 			}
+			fmt.Sscanf(calculatedUnits, "%d", &units)
+			if units < 0 {
+				units = -units
+			}
+			unitsStr := calculatedUnits
+			if !isLong {
+				unitsStr = "-" + calculatedUnits
+			}
+			orderSpec["units"] = unitsStr
 		} else {
-			units = tradeUnits
+			orderSpec["units"] = tradeUnits
+			if !isLong {
+				orderSpec["units"] = "-" + tradeUnits
+			}
+			fmt.Sscanf(tradeUnits, "%d", &units)
 		}
-	} else {
-		// Use fixed units
-		units = tradeUnits
+	} else if orderSpec["units"] == nil {
+		if !isLong {
+			orderSpec["units"] = "-" + tradeUnits
+		} else {
+			orderSpec["units"] = tradeUnits
+		}
+		fmt.Sscanf(tradeUnits, "%d", &units)
 	}
 
-	// For SHORT positions, units should be negative
-	if !isLong {
-		units = "-" + units
+	if units < 0 {
+		units = -units
 	}
 
-	orderSpec["units"] = units
+	// Calculate SL/TP
+	// For pip-based TP/SL: use "distance" so OANDA calculates from actual fill price (avoids slippage)
+	// For dollar/pct-based TP/SL: use "price" since those require current pricing for conversion
 
-	// Parse units as integer for TP calculation
-	unitsInt := 0
-	fmt.Sscanf(units, "%d", &unitsInt)
-	if unitsInt < 0 {
-		unitsInt = -unitsInt // Make positive for calculation
+	// Dynamic ATR-based SL/TP: override pip values per-trade based on current volatility
+	// Also sizes position based on account balance so SL hit = riskPercent% loss
+	if dynamicSLTPEnabled {
+		dynResult, dynErr := calculateDynamicSLTP(symbol, entryPrice)
+		if dynErr != nil {
+			log.Printf("⚠️  [DYNAMIC RISK] Failed, falling back to static values: %v", dynErr)
+		} else {
+			// Set risk-sized units
+			units = dynResult.Units
+			unitsStr := fmt.Sprintf("%d", units)
+			if !isLong {
+				unitsStr = "-" + unitsStr
+			}
+			orderSpec["units"] = unitsStr
+
+			pipValue, pvErr := getPipValue(symbol)
+			if pvErr == nil {
+				_, pipLocation, _ := getInstrumentInfo(symbol)
+				precision := -pipLocation + 1
+				if precision < 1 {
+					precision = 5
+				}
+
+				tpDistance := dynResult.TPPips * pipValue
+				tpDistStr := fmt.Sprintf("%.*f", precision, tpDistance)
+				orderSpec["takeProfitOnFill"] = map[string]interface{}{
+					"distance":    tpDistStr,
+					"timeInForce": "GTC",
+				}
+				log.Printf("🎯 [TP] Dynamic take profit: %s (%.1f pips from fill price)", tpDistStr, dynResult.TPPips)
+
+				slDistance := dynResult.SLPips * pipValue
+				slDistStr := fmt.Sprintf("%.*f", precision, slDistance)
+				orderSpec["stopLossOnFill"] = map[string]interface{}{
+					"distance":    slDistStr,
+					"timeInForce": "GTC",
+				}
+				log.Printf("🛑 [SL] Dynamic stop loss: %s (%.1f pips from fill price)", slDistStr, dynResult.SLPips)
+			} else {
+				log.Printf("⚠️  [DYNAMIC SL/TP] Failed to get pip value, falling back: %v", pvErr)
+			}
+			return orderSpec
+		}
 	}
 
-	// Add take profit if configured
-	if takeProfitPips != "" {
-		// Use distance parameter for pip-based take profit (more accurate)
+	// Take profit
+	if takeProfitPips != "" && takeProfitDollars == "" && takeProfitPct == "" {
+		// Pip-based: use distance for exact pip accuracy from fill price
 		tpDistance, _, err := getTakeProfitDistance(symbol)
-		if err != nil {
-			log.Printf("⚠️  [WARNING] Failed to get take profit distance: %v", err)
-		} else if tpDistance != "" {
+		if err == nil && tpDistance != "" {
 			orderSpec["takeProfitOnFill"] = map[string]interface{}{
 				"distance":    tpDistance,
 				"timeInForce": "GTC",
 			}
-			log.Printf("🎯 [TP] Take profit distance set at %s", tpDistance)
+			log.Printf("🎯 [TP] Take profit distance: %s (%s pips from fill price)", tpDistance, takeProfitPips)
+		} else if err != nil {
+			log.Printf("⚠️  [WARNING] Failed to calculate take profit distance: %v", err)
 		}
-	} else if takeProfitPct != "" || takeProfitDollars != "" {
-		// Use price for percentage/dollar-based take profit
-		// Get current price for TP calculation
-		price, err := getCurrentPrice(symbol)
+	} else if (takeProfitPct != "" || takeProfitDollars != "") && pricing != nil {
+		// Dollar/pct-based: use absolute price
+		tpPrice, err := calculateTakeProfitPrice(pricing, isLong, units)
 		if err != nil {
-			log.Printf("⚠️  [WARNING] Failed to get price for TP calculation: %v", err)
-		} else {
-			tpPrice, err := calculateTakeProfitPrice(symbol, price, isLong, unitsInt)
-			if err != nil {
-				log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
-			} else if tpPrice != "" {
-				orderSpec["takeProfitOnFill"] = map[string]interface{}{
-					"price":       tpPrice,
-					"timeInForce": "GTC",
-				}
-				log.Printf("🎯 [TP] Take profit set at %s", tpPrice)
+			log.Printf("⚠️  [WARNING] Failed to calculate take profit: %v", err)
+		} else if tpPrice != "" {
+			orderSpec["takeProfitOnFill"] = map[string]interface{}{
+				"price":       tpPrice,
+				"timeInForce": "GTC",
 			}
+			log.Printf("🎯 [TP] Take profit price: %s (spread: %.1f pips)", tpPrice, pricing.SpreadPips)
 		}
 	}
 
-	// Add stop loss if configured
-	if stopLossPips != "" {
-		// Use distance parameter for pip-based stop loss (more accurate)
+	// Stop loss
+	if stopLossPips != "" && stopLossDollars == "" && stopLossPct == "" {
+		// Pip-based: use distance for exact pip accuracy from fill price
 		slDistance, _, err := getStopLossDistance(symbol)
-		if err != nil {
-			log.Printf("⚠️  [WARNING] Failed to get stop loss distance: %v", err)
-		} else if slDistance != "" {
+		if err == nil && slDistance != "" {
 			orderSpec["stopLossOnFill"] = map[string]interface{}{
 				"distance":    slDistance,
 				"timeInForce": "GTC",
 			}
-			log.Printf("🛑 [SL] Stop loss distance set at %s", slDistance)
+			log.Printf("🛑 [SL] Stop loss distance: %s (%s pips from fill price)", slDistance, stopLossPips)
+		} else if err != nil {
+			log.Printf("⚠️  [WARNING] Failed to calculate stop loss distance: %v", err)
 		}
-	} else if stopLossPct != "" || stopLossDollars != "" {
-		// Use price for percentage/dollar-based stop loss
-		// Get current price for SL calculation
-		price, err := getCurrentPrice(symbol)
+	} else if (stopLossPct != "" || stopLossDollars != "") && pricing != nil {
+		// Dollar/pct-based: use absolute price
+		slPrice, err := calculateStopLossPrice(pricing, isLong, units)
 		if err != nil {
-			log.Printf("⚠️  [WARNING] Failed to get price for SL calculation: %v", err)
-		} else {
-			slPrice, err := calculateStopLossPrice(symbol, price, isLong, unitsInt)
-			if err != nil {
-				log.Printf("⚠️  [WARNING] Failed to calculate stop loss: %v", err)
-			} else if slPrice != "" {
-				orderSpec["stopLossOnFill"] = map[string]interface{}{
-					"price":       slPrice,
-					"timeInForce": "GTC",
-				}
-				log.Printf("🛑 [SL] Stop loss set at %s", slPrice)
+			log.Printf("⚠️  [WARNING] Failed to calculate stop loss: %v", err)
+		} else if slPrice != "" {
+			orderSpec["stopLossOnFill"] = map[string]interface{}{
+				"price":       slPrice,
+				"timeInForce": "GTC",
 			}
+			log.Printf("🛑 [SL] Stop loss price: %s (spread: %.1f pips)", slPrice, pricing.SpreadPips)
 		}
 	}
 
@@ -7581,6 +8149,10 @@ func openLongPosition(symbol string, price string) {
 		log.Println(strings.Repeat("🟢", 40))
 		log.Println("⚠️  MANUAL ACTION REQUIRED: Mark this entry in TradingView")
 		log.Println(strings.Repeat("🟢", 40))
+
+		if oneTradePerSession {
+			markSessionTradeDone()
+		}
 		return
 	}
 
@@ -7614,6 +8186,10 @@ func openLongPosition(symbol string, price string) {
 	log.Printf("✅ LONG position opened: %s (ID: %s)", symbol, tradeID)
 	log.Printf("💾 [STATE] Position updated - Open=%v, Type=%s, TradeID=%s, All flags cleared",
 		state.PositionOpen, state.Position, state.TradeID)
+
+	if oneTradePerSession {
+		markSessionTradeDone()
+	}
 }
 
 func openShortPosition(symbol string, price string) {
@@ -7754,6 +8330,10 @@ func openShortPosition(symbol string, price string) {
 		log.Println(strings.Repeat("🔴", 40))
 		log.Println("⚠️  MANUAL ACTION REQUIRED: Mark this entry in TradingView")
 		log.Println(strings.Repeat("🔴", 40))
+
+		if oneTradePerSession {
+			markSessionTradeDone()
+		}
 		return
 	}
 
@@ -7787,6 +8367,10 @@ func openShortPosition(symbol string, price string) {
 	log.Printf("✅ SHORT position opened: %s (ID: %s)", symbol, tradeID)
 	log.Printf("💾 [STATE] Position updated - Open=%v, Type=%s, TradeID=%s, All flags cleared",
 		state.PositionOpen, state.Position, state.TradeID)
+
+	if oneTradePerSession {
+		markSessionTradeDone()
+	}
 }
 
 func closePosition(symbol string) {
@@ -7876,6 +8460,11 @@ func closePosition(symbol string) {
 		}
 		mu.Unlock()
 
+		// Mark session trade done if profitable (for ONE_PROFITABLE_TRADE_PER_SESSION)
+		if oneProfitableTradePerSession && plDollars > 0 {
+			markSessionTradeDone()
+		}
+
 		return
 	}
 
@@ -7944,6 +8533,11 @@ func closePosition(symbol string) {
 		log.Printf("💾 [STATE] Position updated - Open=%v, Type=%s", state.PositionOpen, state.Position)
 		if activeStrategy.OneTradeMode {
 			log.Printf("🛑 [STRATEGY] Strategy DISABLED after completing trade (oneTradeMode=true) - re-enable via /enable-strategy")
+		}
+
+		// Mark session trade done if profitable (for ONE_PROFITABLE_TRADE_PER_SESSION)
+		if oneProfitableTradePerSession && realizedPL > 0 {
+			markSessionTradeDone()
 		}
 	} else {
 		log.Printf("❌ Failed to close position (status %d)", resp.StatusCode)
@@ -8113,17 +8707,23 @@ func formatTimeWithZone(t time.Time) string {
 }
 
 func respondSuccess(w http.ResponseWriter, message string) {
-	// Check if trading hours just opened and execute any pending positions
-	checkTradingHoursTransition()
-
-	// Show status report after each webhook event
-	reportStrategyStatus()
-
+	// Respond to TradingView immediately — before any slow OANDA API calls.
+	// TradingView times out after ~5s; blocking on OANDA calls before writing
+	// the response causes delivery failures and alert pauses.
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "success",
 		"message": message,
 	})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// Run post-response work in background — never delays the HTTP response
+	go func() {
+		checkTradingHoursTransition()
+		reportStrategyStatus()
+	}()
 }
 
 // checkTradingHoursTransition checks if trading hours just opened and logs the transition
@@ -8141,6 +8741,11 @@ func checkTradingHoursTransition() {
 		log.Printf("   New positions now allowed. Waiting for fresh entry signals...")
 		log.Printf(strings.Repeat("=", 80) + "\n")
 
+		// Reset session trade limit for the new session
+		if oneTradePerSession || oneProfitableTradePerSession {
+			resetSessionTradeDone()
+		}
+
 		// Reset ALL ATR state so first signal initializes, second signal triggers
 		// This prevents whipsaw trading when hours open with stale state
 		mu.Lock()
@@ -8149,14 +8754,12 @@ func checkTradingHoursTransition() {
 			state.ATRDirectionInitialized = false
 			state.ATRFlipLong = false
 			state.ATRFlipShort = false
-			// Reset ATR state (for idle-aware long/short)
-			// This ensures first signal after hours open is treated as initialization
-			state.ATRLong = false
-			state.ATRShort = false
-			state.ATRIdle = false
+			// Preserve ATR direction (Long/Short/Idle) across the session boundary so
+			// cross detection works even if no fresh signal arrives after midnight.
+			// Only reset cross flags — a fresh flip is still required to enter.
 			state.ATRLongCrossed = false
 			state.ATRShortCrossed = false
-			log.Printf("   🔄 Reset ATR state for %s (will wait for fresh cross)", state.Symbol)
+			log.Printf("   🔄 Reset ATR cross flags for %s (direction preserved, waiting for fresh cross)", state.Symbol)
 		}
 		mu.Unlock()
 	}
@@ -8191,6 +8794,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	dailyTarget := dailyProfitTarget
 	dailyTargetEnabled := dailyProfitTargetEnabled
 	dailyTargetReached := dailyProfitTargetReached
+	sessionDone := sessionTradeDone
 	mu.RUnlock()
 
 	// Fetch real-time P/L from OANDA for open positions
@@ -8203,6 +8807,13 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		"oneTradeMode":    activeStrategy.OneTradeMode,
 		"strategyName":    activeStrategy.Name,
 		"oandaPositions":  oandaPL,
+	}
+
+	// Add session trade limit status if enabled
+	if oneTradePerSession || oneProfitableTradePerSession {
+		response["sessionTradeDone"] = sessionDone
+		response["oneTradePerSession"] = oneTradePerSession
+		response["oneProfitableTradePerSession"] = oneProfitableTradePerSession
 	}
 
 	// Add daily profit tracking if enabled
@@ -8324,6 +8935,93 @@ func reportStrategyStatus() {
 	}
 	log.Println("")
 
+	// Show dynamic risk preview if enabled
+	if dynamicSLTPEnabled {
+		// Determine symbol for preview
+		previewSymbol := "EUR_USD"
+		mu.RLock()
+		for sym := range positions {
+			previewSymbol = sym
+			break
+		}
+		mu.RUnlock()
+
+		atr, atrErr := getATRFromOanda(previewSymbol, atrPeriod, atrTimeframe)
+		balance, balErr := getAccountBalance()
+		if atrErr != nil {
+			log.Printf("  ⚠️  Dynamic risk preview unavailable: ATR error: %v", atrErr)
+		} else if balErr != nil {
+			log.Printf("  ⚠️  Dynamic risk preview unavailable: balance error: %v", balErr)
+		} else {
+			pipVal, pvErr := getPipValue(previewSymbol)
+			if pvErr == nil {
+				atrInPips := atr / pipVal
+				slPips := atrInPips * atrMultiplierSL
+				tpPips := atrInPips * atrMultiplierTP
+				riskAmount := balance * (riskPercent / 100.0)
+				units := int(riskAmount / (slPips * pipVal))
+				if units < 1 {
+					units = 1
+				}
+
+				leverage := 50.0
+				lev, _, levErr := getInstrumentInfo(previewSymbol)
+				if levErr == nil {
+					leverage = lev
+				}
+
+				// Get current price for margin calc
+				pricing, _ := getOandaPricing(previewSymbol)
+				entryPrice := 0.0
+				if pricing != nil {
+					entryPrice = pricing.Ask
+				}
+
+				marginPerUnit := entryPrice / leverage
+				margin := float64(units) * marginPerUnit
+				maxMargin := balance * (maxMarginPercent / 100.0)
+
+				pipsWidened := false
+				if margin > maxMargin && entryPrice > 0 {
+					minSLPips := riskAmount / (maxMargin / marginPerUnit * pipVal)
+					scaleFactor := minSLPips / slPips
+					slPips = minSLPips
+					tpPips = tpPips * scaleFactor
+					units = int(riskAmount / (slPips * pipVal))
+					if units < 1 {
+						units = 1
+					}
+					margin = float64(units) * marginPerUnit
+					pipsWidened = true
+				}
+
+				marginPct := 0.0
+				if balance > 0 {
+					marginPct = (margin / balance) * 100.0
+				}
+				tpAmount := float64(units) * tpPips * pipVal
+
+				log.Println("  ── 📊 DYNAMIC RISK PREVIEW (if next trade fired now) ──")
+				log.Printf("  Balance:  $%.2f", balance)
+				log.Printf("  ATR(%d, %s): %.5f (%.1f pips)", atrPeriod, atrTimeframe, atr, atrInPips)
+				log.Printf("  Formula:  units = risk / (SL pips × pip value)")
+				log.Printf("            units = $%.2f / (%.1f × %.4f) = %d", riskAmount, slPips, pipVal, units)
+				log.Printf("  Risk:     %.1f%% = $%.2f", riskPercent, riskAmount)
+				log.Printf("  SL:       %.1f pips (ATR × %.2f)", slPips, atrMultiplierSL)
+				log.Printf("  TP:       %.1f pips (ATR × %.2f)", tpPips, atrMultiplierTP)
+				log.Printf("  R:R:      1:%.1f", tpPips/slPips)
+				log.Printf("  Position: %d units", units)
+				log.Printf("  Margin:   $%.2f (%.1f%% of balance)", margin, marginPct)
+				log.Printf("  SL hit:   -$%.2f (%.1f%%)  |  TP hit: +$%.2f (%.1f%%)",
+					riskAmount, riskPercent, tpAmount, (tpAmount/balance)*100)
+				if pipsWidened {
+					log.Printf("  ⚠️  Pips widened to fit %.0f%% margin cap", maxMarginPercent)
+				}
+				log.Println("")
+			}
+		}
+	}
+
 	mu.RLock()
 	positionsCount := len(positions)
 	mu.RUnlock()
@@ -8386,11 +9084,10 @@ func reportStrategyStatus() {
 		if state.PositionOpen {
 			// Visual indicator for open position
 			if state.IsSimulated {
-				log.Println("  ┌─────────────────────────────────────────────────────────────────────┐")
-				log.Printf("  │ 🔄 SIMULATED %s POSITION - %s%-29s│",
-					strings.ToUpper(state.Position), state.Exchange, "")
-				log.Printf("  │ Entry: %s @ %s%-33s│",
-					state.SimulatedEntry, state.SimulatedPrice, "")
+				log.Printf("  🔄 SIMULATED %s POSITION - %s",
+					strings.ToUpper(state.Position), state.Exchange)
+				log.Printf("  Entry: %s @ %s",
+					state.SimulatedEntry, state.SimulatedPrice)
 
 				// Calculate and display P/L if we have latest price
 				if state.LatestPrice != "" && state.SimulatedPrice != "" {
@@ -8413,18 +9110,65 @@ func reportStrategyStatus() {
 							plSign = ""
 						}
 
-						log.Printf("  │ Current: %s (%s P/L: %s$%.5f / %s%.2f%%)%-15s│",
-							state.LatestPrice, plColor, plSign, plDollars, plSign, plPercent, "")
+						log.Printf("  Current: %s (%s P/L: %s$%.5f / %s%.2f%%)",
+							state.LatestPrice, plColor, plSign, plDollars, plSign, plPercent)
 					}
 				}
 
-				log.Printf("  │ Trade ID: %s%-48s│", state.TradeID, "")
-				log.Println("  └─────────────────────────────────────────────────────────────────────┘")
+				log.Printf("  Trade ID: %s", state.TradeID)
 			} else {
-				log.Println("  ┌─────────────────────────────────────────────────────────────────────┐")
-				log.Printf("  │ 📈 POSITION OPEN: %s (Trade ID: %s)%-24s│",
-					strings.ToUpper(state.Position), state.TradeID, "")
-				log.Println("  └─────────────────────────────────────────────────────────────────────┘")
+				log.Printf("  📈 POSITION OPEN: %s (Trade ID: %s)",
+					strings.ToUpper(state.Position), state.TradeID)
+
+				// Fetch live trade details from OANDA
+				if state.TradeID != "" {
+					details, detErr := getOandaTradeDetails(state.TradeID)
+					if detErr == nil {
+						// Get current price
+						currentPrice := 0.0
+						pricing, _ := getOandaPricing(symbol)
+						if pricing != nil {
+							if state.Position == "long" {
+								currentPrice = pricing.Bid
+							} else {
+								currentPrice = pricing.Ask
+							}
+						}
+
+						plColor := "🟢"
+						plSign := "+"
+						if details.UnrealizedPL < 0 {
+							plColor = "🔴"
+							plSign = ""
+						}
+
+						units := details.CurrentUnits
+						if units < 0 {
+							units = -units
+						}
+
+						log.Printf("  Entry: %.5f | Current: %.5f", details.Price, currentPrice)
+						log.Printf("  Units: %d | Margin: $%.2f", units, details.MarginUsed)
+						log.Printf("  %s P/L: %s$%.2f", plColor, plSign, details.UnrealizedPL)
+						if details.StopLossPrice > 0 && details.TakeProfitPrice > 0 {
+							pipVal, pvErr := getPipValue(symbol)
+							if pvErr == nil {
+								var slDist, tpDist float64
+								if state.Position == "long" {
+									slDist = (details.Price - details.StopLossPrice) / pipVal
+									tpDist = (details.TakeProfitPrice - details.Price) / pipVal
+								} else {
+									slDist = (details.StopLossPrice - details.Price) / pipVal
+									tpDist = (details.Price - details.TakeProfitPrice) / pipVal
+								}
+								log.Printf("  SL: %.5f (%.1f pips) | TP: %.5f (%.1f pips)",
+									details.StopLossPrice, slDist, details.TakeProfitPrice, tpDist)
+							} else {
+								log.Printf("  SL: %.5f | TP: %.5f", details.StopLossPrice, details.TakeProfitPrice)
+							}
+						}
+					}
+				}
 			}
 			log.Println("") // Show ONLY exit conditions for the current position
 			if state.Position == "long" {
@@ -8682,6 +9426,48 @@ func main() {
 	stopLossPct = os.Getenv("STOP_LOSS_PCT")
 	stopLossDollars = os.Getenv("STOP_LOSS_DOLLARS")
 
+	// Dynamic ATR-based SL/TP configuration
+	if os.Getenv("DYNAMIC_SLTP") == "true" {
+		dynamicSLTPEnabled = true
+		riskPercent = 2.0
+		maxMarginPercent = 50.0
+		atrMultiplierSL = 1.5
+		atrMultiplierTP = 2.0
+		atrPeriod = 14
+		atrTimeframe = "H1"
+
+		if v := os.Getenv("RISK_PERCENT"); v != "" {
+			fmt.Sscanf(v, "%f", &riskPercent)
+		}
+		if v := os.Getenv("MAX_MARGIN_PERCENT"); v != "" {
+			fmt.Sscanf(v, "%f", &maxMarginPercent)
+		}
+		if v := os.Getenv("ATR_MULTIPLIER_SL"); v != "" {
+			fmt.Sscanf(v, "%f", &atrMultiplierSL)
+		}
+		if v := os.Getenv("ATR_MULTIPLIER_TP"); v != "" {
+			fmt.Sscanf(v, "%f", &atrMultiplierTP)
+		}
+		if v := os.Getenv("ATR_PERIOD"); v != "" {
+			fmt.Sscanf(v, "%d", &atrPeriod)
+		}
+		if v := os.Getenv("ATR_TIMEFRAME"); v != "" {
+			atrTimeframe = v
+		}
+		statusIntervalSec = 30
+		if v := os.Getenv("STATUS_INTERVAL"); v != "" {
+			fmt.Sscanf(v, "%d", &statusIntervalSec)
+		}
+
+		log.Println("📊 Dynamic Risk Management: ENABLED")
+		log.Printf("   Risk per trade: %.1f%% of account balance", riskPercent)
+		log.Printf("   Max margin per trade: %.0f%% of balance", maxMarginPercent)
+		log.Printf("   ATR period: %d (%s candles)", atrPeriod, atrTimeframe)
+		log.Printf("   SL: %.1fx ATR | TP: %.1fx ATR", atrMultiplierSL, atrMultiplierTP)
+		log.Printf("   Status interval: %ds while position open", statusIntervalSec)
+		log.Println("   ⚡ Position size, SL, and TP calculated per-trade from balance + volatility")
+	}
+
 	// Daily profit target configuration
 	dailyProfitTargetStr := os.Getenv("DAILY_PROFIT_TARGET")
 	if dailyProfitTargetStr != "" {
@@ -8693,6 +9479,19 @@ func main() {
 		} else {
 			log.Printf("⚠️  Invalid DAILY_PROFIT_TARGET value '%s', feature disabled", dailyProfitTargetStr)
 		}
+	}
+
+	// Session trade limit configuration
+	if os.Getenv("ONE_TRADE_PER_SESSION") == "true" {
+		oneTradePerSession = true
+		log.Println("🔒 One Trade Per Session: ENABLED (entries blocked after first trade opens each session)")
+	}
+	if os.Getenv("ONE_PROFITABLE_TRADE_PER_SESSION") == "true" {
+		oneProfitableTradePerSession = true
+		log.Println("🔒 One Profitable Trade Per Session: ENABLED (entries blocked after first profitable trade closes each session)")
+	}
+	if oneTradePerSession && oneProfitableTradePerSession {
+		log.Println("⚠️  Both ONE_TRADE_PER_SESSION and ONE_PROFITABLE_TRADE_PER_SESSION are set - ONE_TRADE_PER_SESSION takes precedence for blocking on open")
 	}
 
 	// Strategy configuration
@@ -8822,7 +9621,10 @@ func main() {
 	log.Printf("🚀 [STRATEGY] Active: %s", activeStrategy.Name)
 
 	// Show active trading mode
-	if tradeMargin != "" {
+	if dynamicSLTPEnabled {
+		log.Println("💰 Position sizing: DYNAMIC (calculated per-trade from account balance + ATR)")
+		log.Printf("   Risk: %.1f%% of balance | Max margin: %.0f%% of balance", riskPercent, maxMarginPercent)
+	} else if tradeMargin != "" {
 		log.Printf("💰 Margin Amount: $%s (OANDA calculates position size from leverage)", tradeMargin)
 		log.Printf("   ⚡ With 50:1 leverage, $%s margin = ~$%s position", tradeMargin, func() string {
 			margin := 0.0
@@ -8835,9 +9637,32 @@ func main() {
 		log.Printf("💰 Trade Units: %s (fixed)", tradeUnits)
 	}
 
+	// Estimate units for dollar value display
+	estimatedUnits := 0.0
+	if tradeMargin != "" {
+		margin := 0.0
+		fmt.Sscanf(tradeMargin, "%f", &margin)
+		estimatedUnits = margin * 50 / 1.15 // approximate: margin * leverage / price
+	} else if tradeUSDAmount != "" {
+		usd := 0.0
+		fmt.Sscanf(tradeUSDAmount, "%f", &usd)
+		estimatedUnits = usd / 1.15 // approximate
+	} else {
+		fmt.Sscanf(tradeUnits, "%f", &estimatedUnits)
+	}
+
 	// Show take profit settings
-	if takeProfitPips != "" {
-		log.Printf("🎯 Take Profit: %s pips", takeProfitPips)
+	if dynamicSLTPEnabled {
+		log.Printf("🎯 Take Profit: DYNAMIC (ATR × %.1f per trade)", atrMultiplierTP)
+	} else if takeProfitPips != "" {
+		tpPips := 0.0
+		fmt.Sscanf(takeProfitPips, "%f", &tpPips)
+		if estimatedUnits > 0 {
+			tpDollars := tpPips * 0.0001 * estimatedUnits // approximate for major pairs
+			log.Printf("🎯 Take Profit: %s pips (~$%.2f)", takeProfitPips, tpDollars)
+		} else {
+			log.Printf("🎯 Take Profit: %s pips", takeProfitPips)
+		}
 	} else if takeProfitPct != "" {
 		log.Printf("🎯 Take Profit: %s%%", takeProfitPct)
 	} else if takeProfitDollars != "" {
@@ -8847,8 +9672,17 @@ func main() {
 	}
 
 	// Show stop loss settings
-	if stopLossPips != "" {
-		log.Printf("🛑 Stop Loss: %s pips", stopLossPips)
+	if dynamicSLTPEnabled {
+		log.Printf("🛑 Stop Loss: DYNAMIC (ATR × %.1f per trade)", atrMultiplierSL)
+	} else if stopLossPips != "" {
+		slPips := 0.0
+		fmt.Sscanf(stopLossPips, "%f", &slPips)
+		if estimatedUnits > 0 {
+			slDollars := slPips * 0.0001 * estimatedUnits
+			log.Printf("🛑 Stop Loss: %s pips (~$%.2f)", stopLossPips, slDollars)
+		} else {
+			log.Printf("🛑 Stop Loss: %s pips", stopLossPips)
+		}
 	} else if stopLossPct != "" {
 		log.Printf("🛑 Stop Loss: %s%%", stopLossPct)
 	} else if stopLossDollars != "" {
@@ -8911,17 +9745,14 @@ func main() {
 	if tradingHoursEnabled {
 		wasWithinTradingHours = isWithinTradingHours()
 		if wasWithinTradingHours {
-			log.Printf("🔄 [STARTUP] Trading hours OPEN - resetting ATR state for fresh signals")
+			log.Printf("🔄 [STARTUP] Trading hours OPEN - resetting ATR cross flags for fresh signals")
 			mu.Lock()
 			for _, state := range positions {
 				// Reset direction tracking (for flip detection)
 				state.ATRDirectionInitialized = false
 				state.ATRFlipLong = false
 				state.ATRFlipShort = false
-				// Reset ATR state (for idle-aware long/short)
-				state.ATRLong = false
-				state.ATRShort = false
-				state.ATRIdle = false
+				// Reset cross flags only — direction state is empty on fresh boot anyway
 				state.ATRLongCrossed = false
 				state.ATRShortCrossed = false
 			}
@@ -8937,6 +9768,7 @@ func main() {
 			if err := periodicSyncPositionsFromOanda(); err != nil {
 				log.Printf("⚠️  [SYNC] Periodic sync failed: %v", err)
 			}
+			checkSessionTradeDailyReset()
 		}
 	}()
 	log.Printf("🔄 [SYNC] Periodic OANDA sync enabled (every 5 minutes)")
@@ -8970,6 +9802,9 @@ func main() {
 	http.HandleFunc("/webhook/atr/long", handleATRLong)
 	http.HandleFunc("/webhook/atr/short", handleATRShort)
 	http.HandleFunc("/webhook/atr/idle", handleATRIdle)
+
+	// Trendline Webhooks (dynamic numbered routes: /webhook/trendline/1, /webhook/trendline/2, etc.)
+	http.HandleFunc("/webhook/trendline/", handleTrendline)
 
 	// Stochastic Webhooks
 	http.HandleFunc("/webhook/stochastic/oversold", handleStochasticOversold)
@@ -9178,12 +10013,40 @@ func main() {
 	log.Println("")
 
 	// Start periodic TP/SL detection checker
+	// Start periodic position monitor (every minute)
+	// - Checks for closed positions (TP/SL fills)
+	// Show dynamic risk preview once at startup (after ngrok/config is ready)
+	if dynamicSLTPEnabled {
+		log.Println("\n📊 Startup risk preview:")
+		reportStrategyStatus()
+	}
+
+	// - Shows status report with live P/L when a position is open
 	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
+		interval := 30 * time.Second
+		if statusIntervalSec > 0 {
+			interval = time.Duration(statusIntervalSec) * time.Second
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for range ticker.C {
 			checkClosedPositions()
+
+			// Show status report while a position is open
+			mu.RLock()
+			hasOpenPosition := false
+			for _, state := range positions {
+				if state.PositionOpen && !state.IsSimulated {
+					hasOpenPosition = true
+					break
+				}
+			}
+			mu.RUnlock()
+
+			if hasOpenPosition {
+				reportStrategyStatus()
+			}
 		}
 	}()
 
