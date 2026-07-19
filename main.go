@@ -7380,46 +7380,64 @@ func getTradeSpec(symbol string, isLong bool) map[string]interface{} {
 	// Dynamic ATR-based SL/TP: override pip values per-trade based on current volatility
 	// Also sizes position based on account balance so SL hit = riskPercent% loss
 	if dynamicSLTPEnabled {
-		dynResult, dynErr := calculateDynamicSLTP(symbol, entryPrice)
-		if dynErr != nil {
-			log.Printf("⚠️  [DYNAMIC RISK] Failed, falling back to static values: %v", dynErr)
-		} else {
-			// Set risk-sized units
-			units = dynResult.Units
-			unitsStr := fmt.Sprintf("%d", units)
-			if !isLong {
-				unitsStr = "-" + unitsStr
+		// Retry dynamic sizing on transient OANDA failures (e.g. empty candle data,
+		// "invalid instruments data"). Never silently fall back to the static 100-unit
+		// default — an unsized, unprotected position is worse than no trade.
+		const maxDynAttempts = 3 // initial attempt + 2 retries
+		var dynResult *DynamicRiskResult
+		var dynErr error
+		for attempt := 1; attempt <= maxDynAttempts; attempt++ {
+			dynResult, dynErr = calculateDynamicSLTP(symbol, entryPrice)
+			if dynErr == nil {
+				break
 			}
-			orderSpec["units"] = unitsStr
-
-			pipValue, pvErr := getPipValue(symbol)
-			if pvErr == nil {
-				_, pipLocation, _ := getInstrumentInfo(symbol)
-				precision := -pipLocation + 1
-				if precision < 1 {
-					precision = 5
-				}
-
-				tpDistance := dynResult.TPPips * pipValue
-				tpDistStr := fmt.Sprintf("%.*f", precision, tpDistance)
-				orderSpec["takeProfitOnFill"] = map[string]interface{}{
-					"distance":    tpDistStr,
-					"timeInForce": "GTC",
-				}
-				log.Printf("🎯 [TP] Dynamic take profit: %s (%.1f pips from fill price)", tpDistStr, dynResult.TPPips)
-
-				slDistance := dynResult.SLPips * pipValue
-				slDistStr := fmt.Sprintf("%.*f", precision, slDistance)
-				orderSpec["stopLossOnFill"] = map[string]interface{}{
-					"distance":    slDistStr,
-					"timeInForce": "GTC",
-				}
-				log.Printf("🛑 [SL] Dynamic stop loss: %s (%.1f pips from fill price)", slDistStr, dynResult.SLPips)
-			} else {
-				log.Printf("⚠️  [DYNAMIC SL/TP] Failed to get pip value, falling back: %v", pvErr)
+			log.Printf("⚠️  [DYNAMIC RISK] Attempt %d/%d failed: %v", attempt, maxDynAttempts, dynErr)
+			if attempt < maxDynAttempts {
+				time.Sleep(2 * time.Second)
 			}
-			return orderSpec
 		}
+		if dynErr != nil {
+			log.Printf("❌ [DYNAMIC RISK] All %d attempts failed — ABORTING trade (no static fallback): %v", maxDynAttempts, dynErr)
+			return nil
+		}
+
+		// Set risk-sized units
+		units = dynResult.Units
+		unitsStr := fmt.Sprintf("%d", units)
+		if !isLong {
+			unitsStr = "-" + unitsStr
+		}
+		orderSpec["units"] = unitsStr
+
+		pipValue, pvErr := getPipValue(symbol)
+		if pvErr != nil {
+			// Sizing succeeded but we can't compute SL/TP distances — placing the order
+			// now would leave the position unprotected. Abort instead.
+			log.Printf("❌ [DYNAMIC SL/TP] Failed to get pip value for SL/TP — ABORTING trade (would be unprotected): %v", pvErr)
+			return nil
+		}
+		_, pipLocation, _ := getInstrumentInfo(symbol)
+		precision := -pipLocation + 1
+		if precision < 1 {
+			precision = 5
+		}
+
+		tpDistance := dynResult.TPPips * pipValue
+		tpDistStr := fmt.Sprintf("%.*f", precision, tpDistance)
+		orderSpec["takeProfitOnFill"] = map[string]interface{}{
+			"distance":    tpDistStr,
+			"timeInForce": "GTC",
+		}
+		log.Printf("🎯 [TP] Dynamic take profit: %s (%.1f pips from fill price)", tpDistStr, dynResult.TPPips)
+
+		slDistance := dynResult.SLPips * pipValue
+		slDistStr := fmt.Sprintf("%.*f", precision, slDistance)
+		orderSpec["stopLossOnFill"] = map[string]interface{}{
+			"distance":    slDistStr,
+			"timeInForce": "GTC",
+		}
+		log.Printf("🛑 [SL] Dynamic stop loss: %s (%.1f pips from fill price)", slDistStr, dynResult.SLPips)
+		return orderSpec
 	}
 
 	// Take profit
@@ -8158,6 +8176,10 @@ func openLongPosition(symbol string, price string) {
 
 	// Real OANDA trade
 	orderSpec := getTradeSpec(symbol, true) // true = LONG
+	if orderSpec == nil {
+		log.Printf("🚫 [TRADE] LONG aborted: dynamic sizing/risk unavailable (no fallback trade placed)")
+		return
+	}
 
 	orderData := map[string]interface{}{
 		"order": orderSpec,
@@ -8339,6 +8361,10 @@ func openShortPosition(symbol string, price string) {
 
 	// Real OANDA trade
 	orderSpec := getTradeSpec(symbol, false) // false = SHORT
+	if orderSpec == nil {
+		log.Printf("🚫 [TRADE] SHORT aborted: dynamic sizing/risk unavailable (no fallback trade placed)")
+		return
+	}
 
 	orderData := map[string]interface{}{
 		"order": orderSpec,
